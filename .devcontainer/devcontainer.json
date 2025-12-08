@@ -2,7 +2,7 @@
   "name": "Linux Mint",
   "service": "qemu",
   "containerEnv": {
-    "BOOT": "https://archive.org/download/phoenix-osinstaller-v-3.6.1.564-x-64_202407/PhoenixOSInstaller_v3.6.1.564_x64.iso"
+    "BOOT": "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2-k49.iso/download"
   },
   "forwardPorts": [8006],
   "portsAttributes": {
