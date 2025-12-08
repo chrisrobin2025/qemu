@@ -2,7 +2,7 @@
   "name": "Linux Mint",
   "service": "qemu",
   "containerEnv": {
-    "BOOT": "https://archive.org/download/google-chrome-os-.-iso-team-mjy-movie-jockey.-com/Google%20Chrome%20OS%20.ISO%20~%20Team%20MJY%20~MovieJockey.Com.iso"
+    "BOOT": "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-13.2.0-amd64-xfce.iso"
   },
   "forwardPorts": [8006],
   "portsAttributes": {
