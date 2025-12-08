@@ -2,7 +2,7 @@
   "name": "Linux Mint",
   "service": "qemu",
   "containerEnv": {
-    "BOOT": "mint"
+    "BOOT": "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/FOSS/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-foss-20241011.iso"
   },
   "forwardPorts": [8006],
   "portsAttributes": {
