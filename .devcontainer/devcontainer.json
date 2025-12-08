@@ -2,7 +2,7 @@
   "name": "Linux Mint",
   "service": "qemu",
   "containerEnv": {
-    "BOOT": "https://downloads.blissroms.org/download/x86_64/BlissOS‑x86_64‑LATEST.iso"
+    "BOOT": "https://archive.org/download/phoenix-osinstaller-v-3.6.1.564-x-64_202407/PhoenixOSInstaller_v3.6.1.564_x64.iso"
   },
   "forwardPorts": [8006],
   "portsAttributes": {
