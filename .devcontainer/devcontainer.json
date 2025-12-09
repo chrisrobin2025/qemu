@@ -2,7 +2,7 @@
   "name": "Linux Mint",
   "service": "qemu",
   "containerEnv": {
-    "BOOT": "https://download.fedoraproject.org/pub/fedora/linux/releases/43/Workstation/x86_64/iso/Fedora-Workstation-Live-43-1.6.x86_64.iso"
+    "BOOT": "https://download.bazzite.gg/bazzite-stable-live.iso"
   },
   "forwardPorts": [8006],
   "portsAttributes": {
