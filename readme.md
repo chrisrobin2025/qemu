@@ -15,15 +15,20 @@ Docker container for running virtual machines using QEMU.
 
 ## Features ✨
 
-  - Web-based viewer to control the machine directly from your browser
-
-  - Supports `.iso`, `.img`, `.qcow2`, `.vhd`, `.vhdx`, `.vdi`, `.vmdk` and `.raw` disk formats
-
-  - High-performance options (like KVM acceleration, kernel-mode networking, IO threading, etc.) to achieve near-native speed
+- Runs virtual machines inside a Docker container
+- Supports almost every disk and image format
+- Web-based viewer for controlling the VM
+- Near-native performance with KVM acceleration
+- Customizable CPU, memory, and storage allocation
+- Hardware-accelerated OpenGL, Vulkan and vDRM graphics
+- Dynamic memory allocation with memory ballooning
+- USB passthrough and host folder sharing
+- Supports NAT, user-mode, macvlan, and macvtap networking
+- Automatic downloads for popular Linux distributions
 
 ## Usage  🐳
 
-##### Via Docker Compose:
+##### Docker Compose:
 
 ```yaml
 services:
@@ -45,21 +50,29 @@ services:
     stop_grace_period: 2m
 ```
 
-##### Via Docker CLI:
+##### Docker CLI:
 
 ```bash
 docker run -it --rm --name qemu -e "BOOT=mint" -p 8006:8006 --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v "${PWD:-.}/qemu:/storage" --stop-timeout 120 docker.io/qemux/qemu
 ```
 
-##### Via Kubernetes:
+##### Kubernetes:
 
 ```shell
 kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/kubernetes.yml
 ```
 
-##### Via Github Codespaces:
+##### GitHub Codespaces:
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/qemus/qemu)
+
+## Requirements ⚙️
+
+- Docker or Podman on a Linux host with KVM support.
+- Docker Desktop or Podman (Desktop) on Windows 11 with nested virtualization enabled.
+
+> [!NOTE]
+> Docker Desktop on Linux, macOS, and Windows 10 does not currently provide KVM access to containers and is therefore not supported.
 
 ## FAQ 💬
 
@@ -71,7 +84,7 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
 
   - Start the container and connect to [port 8006](http://127.0.0.1:8006/) using your web browser.
 
-  - You will see the screen and can now install the OS of your choice using your keyboard and mouse.
+  - Complete the installation using the web-based viewer.
 
   Enjoy your brand new machine, and don't forget to star this repo!
 
@@ -109,7 +122,8 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
   | `ubuntu`   | Ubuntu Desktop  | 6.0 GB  |
   | `ubuntus`  | Ubuntu Server   | 3.0 GB  |
   | `xubuntu`  | Xubuntu         | 4.0 GB  |
-  | `zorin`    | Zorin OS         | 3.8 GB  |
+  | `zima`     | ZimaOS          | 1.4 GB  |
+  | `zorin`    | Zorin OS        | 3.8 GB  |
 
 ### How can I use my own image?
 
@@ -165,7 +179,7 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
   ```
 
 > [!TIP]
-> This can also be used to resize the existing disk to a larger capacity without any data loss.
+> This can also be used to resize an existing disk to a larger capacity without any data loss. However, you will need to manually extend the disk partition afterwards inside your OS, since the added disk space will appear as unallocated.
 
 ### How do I change the amount of CPU or RAM?
 
@@ -178,6 +192,34 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
     RAM_SIZE: "8G"
     CPU_CORES: "4"
   ```
+
+### How do I share files with the host?
+
+  To share files with the host, first ensure that your guest OS has `9pfs` support compiled in or available as a kernel module. If so, add the following volume to your compose file:
+
+  ```yaml
+  volumes:
+    - ./example:/shared
+  ```
+
+  Then start the container and execute the following command in the guest:
+
+  ```shell
+  mount -t 9p -o trans=virtio shared /mnt/example
+  ```
+
+  Now the `./example` directory on the host will be available as `/mnt/example` in the guest.
+
+### How do I enable audio?
+
+  Audio is disabled by default. To stream it to the browser, add the following environment variable:
+
+  ```yaml
+  environment:
+    AUDIO: "Y"
+  ```
+
+  Then enable **Audio** under **Settings → Advanced** in the web viewer. The stream is only active while this option is enabled, so it uses no extra bandwidth otherwise.
 
 ### How do I boot ARM64 images?
 
@@ -212,34 +254,6 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
   ```
 
   If it still fails to boot, you can set the value to `ide` to emulate a IDE drive, which is relatively slow but requires no drivers and is compatible with almost every system.
-
-### How do I verify if my system supports KVM?
-
-  First check if your software is compatible using this chart:
-
-  | **Product**  | **Linux** | **Win11** | **Win10** | **macOS** |
-  |---|---|---|---|---|
-  | Docker CLI        | ✅   | ✅       | ❌        | ❌ |
-  | Docker Desktop    | ❌   | ✅       | ❌        | ❌ |
-  | Podman CLI        | ✅   | ✅       | ❌        | ❌ |
-  | Podman Desktop    | ✅   | ✅       | ❌        | ❌ |
-
-  After that you can run the following commands in Linux to check your system:
-
-  ```bash
-  sudo apt install cpu-checker
-  sudo kvm-ok
-  ```
-
-  If you receive an error from `kvm-ok` indicating that KVM cannot be used, please check whether:
-
-  - the virtualization extensions (`Intel VT-x` or `AMD SVM`) are enabled in your BIOS.
-
-  - you enabled "nested virtualization" if you are running the container inside a virtual machine.
-
-  - you are not using a cloud provider, as most of them do not allow nested virtualization for their VPS's.
-
-  If you did not receive any error from `kvm-ok` but the container still complains about a missing KVM device, it could help to add `privileged: true` to your compose file (or `sudo` to your `docker` command) to rule out any permission issue.
 
 ### How do I expose network ports?
 
@@ -324,9 +338,9 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
     - ./example3:/storage3
   ```
 
-### How do I pass-through a disk?
+### How do I pass through a disk?
 
-  It is possible to pass-through disk devices or partitions directly by adding them to your compose file in this way:
+  You can pass through disk devices or partitions directly by adding them to your compose file in this way:
 
   ```yaml
   devices:
@@ -336,9 +350,9 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
 
   Use `/disk1` if you want it to become your main drive, and use `/disk2` and higher to add them as secondary drives.
 
-### How do I pass-through a USB device?
+### How do I pass through a USB device?
 
-  To pass-through a USB device, first lookup its vendor and product id via the `lsusb` command, then add them to your compose file like this:
+  To pass through a USB device, first look up its vendor and product IDs via the `lsusb` command, then add them to your compose file like this:
 
   ```yaml
   environment:
@@ -347,22 +361,43 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
     - /dev/bus/usb
   ```
 
-### How do I share files with the host?
+### How do I enable GPU acceleration?
 
-  To share files with the host, first ensure that your guest OS has `9pfs` support compiled in or available as a kernel module. If so, add the following volume to your compose file:
+  To enable hardware-accelerated graphics using an Intel or AMD GPU, add the following lines to your compose file:
 
   ```yaml
-  volumes:
-    - ./example:/shared
+  environment:
+    GPU: "Y"
+  devices:
+    - /dev/dri
   ```
 
-  Then start the container and execute the following command in the guest:
+  For NVIDIA GPUs, the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host and the GPU must be exposed to the container:
 
-  ```shell
-  mount -t 9p -o trans=virtio shared /mnt/example
+  ```yaml
+  environment:
+    GPU: "Y"
+    NVIDIA_DRIVER_CAPABILITIES: "all"
+
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities:
+              - gpu
   ```
 
-  Now the `./example` directory on the host will be available as `/mnt/example` in the guest.
+  GPU acceleration provides hardware-accelerated OpenGL on Intel, AMD, and NVIDIA GPUs.
+
+  Vulkan acceleration is also enabled automatically when supported on hosts running Linux 6.13 or newer, and requires a guest with Venus support, such as Linux 5.16 or newer with Mesa 24.2 or newer. NVIDIA additionally requires driver version 570.86 or newer.
+
+### How do I enable dynamic memory allocation?
+
+  By default, the VM is allocated the full amount of RAM configured via `RAM_SIZE` for its entire lifetime.
+
+  However, you can enable [memory ballooning](docs/ballooning.md) if you want the container to dynamically reclaim unused guest RAM based on host memory pressure.
 
 ### How can I provide custom arguments to QEMU?
 
@@ -380,8 +415,47 @@ kubectl apply -f https://raw.githubusercontent.com/qemus/qemu/refs/heads/master/
     DEBUG: "Y"
   ```
 
+### Are these all available options?
+
+  No. For a complete overview of all supported settings, see the [environment variables](docs/environment.md) page.
+
+### How do I verify that KVM is available?
+
+  First, make sure your platform and container runtime meet the [requirements](#requirements-️) listed above.
+
+  On a Linux host, install `cpu-checker` and run:
+
+  ```bash
+  sudo apt install cpu-checker
+  sudo kvm-ok
+  ```
+
+  A working configuration should report:
+
+  ```text
+  KVM acceleration can be used
+  ```
+
+  You can also verify that the KVM device exists:
+
+  ```bash
+  ls -l /dev/kvm
+  ```
+
+  If KVM is unavailable, check whether:
+
+  - Hardware virtualization (`Intel VT-x` or `AMD-V`) is enabled in your BIOS or UEFI.
+  - Nested virtualization is enabled when the host itself is a virtual machine.
+  - Your VPS or cloud provider supports nested virtualization.
+
+  If `kvm-ok` succeeds but the container still reports that KVM is unavailable, you can temporarily add `privileged: true` to your Compose file to rule out a permission or device-access issue.
+
+### How do I run Proxmox as a container?
+
+  If you prefer a web-based management interface, or some advanced features that this container may not offer, you can try out [dockur/proxmox](https://github.com/dockur/proxmox).
+
 ## Stars 🌟
-[![Stars](https://starchart.cc/qemus/qemu.svg?variant=adaptive)](https://starchart.cc/qemus/qemu)
+[![Stargazers](https://raw.githubusercontent.com/star-stats/stars/refs/heads/data/charts/qemus-qemu.svg)](https://github.com/qemus/qemu/stargazers)
 
 [build_url]: https://github.com/qemus/qemu/
 [hub_url]: https://hub.docker.com/r/qemux/qemu/

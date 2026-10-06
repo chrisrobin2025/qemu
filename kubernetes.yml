@@ -18,6 +18,8 @@ metadata:
     name: qemu
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: qemu
@@ -60,6 +62,7 @@ spec:
           claimName: qemu-pvc
       - hostPath:
           path: /dev/kvm
+          type: CharDevice
         name: dev-kvm
       - hostPath:
           path: /dev/net/tun

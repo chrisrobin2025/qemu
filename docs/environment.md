@@ -1,0 +1,152 @@
+# Environment Variables
+
+This page lists all the environment variables that can be used to configure the container.
+
+An empty default means the variable is unset and its value is determined automatically when applicable.
+
+## 💿 Image
+
+| Variable | Default | Description |
+|---|---|---|
+| `BOOT` | `alpine` | Image name, or a direct URL to an ISO or disk image. |
+| `CONNECTIONS` | `4` | Number of connections used for image downloads. |
+
+## 🧠 CPU and Memory
+
+| Variable | Default | Description |
+|---|---|---|
+| `CPU_CORES` | `2` | Number of virtual CPU cores, such as `4`, `half`, or `max`. |
+| `CPU_MODEL` | `host` | QEMU CPU model. |
+| `CPU_FLAGS` |  | Additional QEMU CPU flags. |
+| `SMP` |  | Custom CPU topology. Determined from `CPU_CORES` when unset. |
+| `KVM` | `Y` | Enables KVM hardware acceleration. |
+| `VMX` | `N` | Exposes Intel VMX virtualization extensions to the guest. |
+| `HV` | `Y` | Enables Hyper-V enlightenments for Windows guests. |
+| `RAM_SIZE` | `2G` | Amount of RAM assigned to the VM, such as `2G`, `4G`, `half`, or `max`. |
+| `RAM_BACKEND` |  | Guest RAM backing mechanism, set `memfd` for memfd-backed memory. |
+| `RAM_CHECK` | `Y` | Checks whether enough host memory is available before starting the VM. |
+
+## 💾 Storage
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISK_SIZE` | `64G` | Size of the primary VM disk. |
+| `DISK_FMT` | `raw` | Disk image format: `raw` or `qcow2`. |
+| `DISK_TYPE` | `scsi` | Disk device type, such as `ide`, `scsi`, or `blk`. |
+| `DISK_CACHE` | `none` | Disk cache mode, such as `none` or `writeback`. |
+| `DISK_IO` | `native` | Disk I/O mode, such as `native`, `threads`, or `io_uring`. |
+| `DISK_DISCARD` | `unmap` | Discard/TRIM mode for the primary disk. |
+| `DISK_ROTATION` | `1` | Rotation rate reported to the guest. Use `1` to identify the disk as an SSD. |
+| `DISK_FLAGS` |  | Additional options used when creating `qcow2` disks. |
+| `DISK_OPTIONS` |  | Additional options appended to QEMU disk devices. |
+| `ALLOCATE` | `N` | Preallocates space for the primary disk. |
+| `STORAGE` | `/storage` | Storage directory used for disks, firmware variables, and downloads. |
+
+## 🌐 Networking
+
+| Variable | Default | Description |
+|---|---|---|
+| `NETWORK` |  | Network mode, such as `nat`, `user`, or `N` to disable networking. |
+| `DHCP` | `N` | Enables macvtap networking so the VM receives a DHCP address. |
+| `HOST` |  | Hostname assigned to the machine on the network. |
+| `IP` |  | Overrides the automatically selected guest IPv4 address. |
+| `MAC` |  | Guest network adapter MAC address. |
+| `ADAPTER` | `virtio-net-pci` | QEMU network adapter model. |
+| `DEV` | `eth0` | Container network interface used as the uplink. |
+| `MTU` |  | MTU assigned to the guest network interface. |
+| `MASK` | `255.255.255.0` | IPv4 netmask for guest network. |
+| `TAP` | `qemu` | TAP or macvtap interface name. |
+| `BRIDGE` | `docker` | Bridge name used for NAT networking. |
+| `HOST_PORTS` |  | Ports excluded from guest forwarding. |
+| `USER_PORTS` |  | Additional ports to forward to the VM when using user-mode networking. |
+| `DNSMASQ_OPTS` |  | Additional options passed to dnsmasq. |
+| `DNSMASQ_DEBUG` | `N` | Enables dnsmasq debug output. |
+| `DNSMASQ_DISABLE` | `N` | Disables the internal dnsmasq resolver. |
+| `PASST_OPTS` |  | Additional options passed to passt. |
+| `PASST_DEBUG` | `N` | Enables passt debug output. |
+
+## 🖥️ Display
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISPLAY` | `web` | Display backend, such as `web`, `vnc`, `disabled`, or `none`. |
+| `VGA` | `virtio` | QEMU video adapter model. |
+| `GPU` | `N` | Enables OpenGL/Vulkan GPU acceleration and DRM native context. |
+| `VRAM_SIZE` | `4G` | Virtual GPU memory budget. |
+| `RENDERNODE` | `/dev/dri/renderD128` | Render node used for GPU acceleration. |
+
+## 🌍 Web UI
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEB` | `Y` | Enables the web interface. |
+| `WEB_PORT` | `8006` | Port for the web interface. |
+| `VNC_PORT` | `5900` | Port for the VNC server. |
+| `LOSSY` | `N` | Enables lossy VNC compression to reduce bandwidth usage. |
+| `AUDIO` | `N` | Streams guest audio to the web viewer. |
+| `PROTECT` | `N` | Enables password protection for the web interface. |
+
+## ⚙️ System
+
+| Variable | Default | Description |
+|---|---|---|
+| `MACHINE` | `q35` | QEMU machine type. |
+| `PCI_BUS` | `pcie.0` | Overrides the PCI bus used for attached devices. |
+| `UUID` |  | UUID assigned to the VM. |
+| `RNG` | `Y` | Adds the Virtio RNG device to the machine. |
+| `HPET` | `N` | HPET timer setting. |
+| `VMPORT` | `N` | VMware port setting. |
+| `MOUSE` | `usb-tablet` | Pointing device used by the machine. |
+| `SOUND` | `intel-hda` | Audio device used when `AUDIO=Y`. |
+| `SM_BIOS` |  | Additional arguments passed to QEMU’s `-smbios` option. |
+| `ARGUMENTS` |  | Additional raw arguments appended to the QEMU command line. |
+
+## 🚀 Boot
+
+| Variable | Default | Description |
+|---|---|---|
+| `BOOT_MODE` | `uefi` | Boot configuration, such as `uefi`, `secure`, or `legacy`. |
+| `BOOT_INDEX` | `9` | Boot priority index for the installation media. |
+| `MEDIA_TYPE` |  | Device type used for installation media. |
+| `USB` | `qemu-xhci` | QEMU USB controller configuration. |
+| `BIOS` |  | Custom firmware file. |
+| `TPM` | `N` | Enables the TPM emulator, usually set by `BOOT_MODE`. |
+| `SMM` | `N` | Enables System Management Mode, usually set by `BOOT_MODE`. |
+| `LOGO` | `Y` | Enables the custom boot logo. |
+| `CLEAR` | `N` | Resets the NVRAM variables on the next boot. |
+
+## 🎈 Memory Ballooning
+
+Also see [Dynamic memory allocation](ballooning.md) for usage instructions and important caveats.
+
+| Variable | Default | Description |
+|---|---|---|
+| `BALLOONING` | `N` | Enables dynamic memory ballooning. |
+| `BALLOONING_MIN_MEM` | `33%` | Minimum amount of memory retained by the VM. |
+| `BALLOONING_RAM_THRESHOLD` | `80.0` | Host RAM usage percentage at which ballooning begins adjusting memory. |
+| `BALLOONING_RAM_THRESHOLD_HARD` | `90.0` | Host RAM usage percentage at which ballooning becomes more aggressive. |
+| `BALLOONING_PSI_PRESSURE` | `10.0` | PSI memory pressure level at which ballooning becomes more aggressive. |
+| `BALLOONING_PSI_PRESSURE_MAX` | `50.0` | PSI memory pressure level at which ballooning reaches its strongest response. |
+| `BALLOONING_HYSTERESIS` | `128M` | Minimum memory change before the balloon target is updated. |
+| `BALLOONING_KP` | `0.5` | Proportional gain used by the ballooning controller. |
+| `BALLOONING_KI` | `0.05` | Integral gain used by the ballooning controller. |
+| `BALLOONING_INTERVAL` | `5` | Polling interval in seconds. |
+| `BALLOONING_DEBUG` | `N` | Enables debug output for the ballooning monitor. |
+
+## 🔌 Shutdown
+
+| Variable | Default | Description |
+|---|---|---|
+| `SHUTDOWN` | `Y` | Enables graceful ACPI shutdown. |
+| `TIMEOUT` | `13` | Maximum time, in seconds, to wait before forcing the VM to stop. |
+
+## 🐞 Debugging
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEBUG` | `N` | Enables verbose debug output. |
+| `TRACE` | `N` | Enables shell command tracing. |
+| `SERIAL` | `mon:stdio` | QEMU serial device, such as `/storage/serial.sock` or `4444`. |
+| `MONITOR` |  | QEMU monitor, such as `/storage/monitor.sock` or `4444`. |
+| `QMP` |  | QEMU Machine Protocol, such as `/storage/qmp.sock` or `4444`. |
+| `QGA` |  | QEMU Guest Agent, such as `/storage/qga.sock` or `4444`. |

@@ -3,43 +3,764 @@ set -Eeuo pipefail
 
 # Docker environment variables
 
-: "${MAC:=""}"
-: "${MTU:=""}"
 : "${DHCP:="N"}"
 : "${NETWORK:="Y"}"
 : "${HOST_PORTS:=""}"
 : "${USER_PORTS:=""}"
+: "${CHECK_PORT:="80"}"
 : "${ADAPTER:="virtio-net-pci"}"
 
-: "${VM_NET_IP:=""}"
-: "${VM_NET_DEV:=""}"
-: "${VM_NET_TAP:="qemu"}"
-: "${VM_NET_MAC:="$MAC"}"
-: "${VM_NET_HOST:="$APP"}"
-: "${VM_NET_BRIDGE:="docker"}"
-: "${VM_NET_MASK:="255.255.255.0"}"
+: "${IP:="${VM_NET_IP:-}"}"
+: "${DEV:="${VM_NET_DEV:-}"}"
+: "${MTU:="${VM_NET_MTU:-}"}"
+: "${TAP:="${VM_NET_TAP:-qemu}"}"
+: "${HOST:="${VM_NET_HOST:-$APP}"}"
+: "${MAC:="${VM_NET_MAC:-${MAC:-}}"}"
+: "${BRIDGE:="${VM_NET_BRIDGE:-docker}"}"
+: "${MASK:="${VM_NET_MASK:-255.255.255.0}"}"
 
 : "${PASST:="/run/passt"}"
-: "${PASST_MTU:=""}"
 : "${PASST_OPTS:=""}"
 : "${PASST_DEBUG:=""}"
 : "${PASST_PID:="/var/run/passt.pid"}"
+: "${PASST_SOCKET:="/tmp/passt.socket"}"
 
 : "${DNSMASQ_OPTS:=""}"
 : "${DNSMASQ_DEBUG:=""}"
 : "${DNSMASQ:="/usr/sbin/dnsmasq"}"
 : "${DNSMASQ_PID:="/var/run/dnsmasq.pid"}"
-: "${DNSMASQ_CONF_DIR:="/etc/dnsmasq.d"}"
+
+# Sanitize variables
+IP=$(strip "$IP")
+DEV=$(strip "$DEV")
+MTU=$(strip "$MTU")
+TAP=$(strip "$TAP")
+MAC=$(strip "$MAC")
+HOST=$(strip "$HOST")
+MASK=$(strip "$MASK")
+BRIDGE=$(strip "$BRIDGE")
+ADAPTER=$(strip "$ADAPTER")
+NETWORK=$(strip "$NETWORK")
+HOST_PORTS=$(strip "$HOST_PORTS")
+USER_PORTS=$(strip "$USER_PORTS")
+CHECK_PORT=$(strip "$CHECK_PORT")
 
 ADD_ERR="Please add the following setting to your container:"
 
 # ######################################
-#  Functions
+#  Generic helpers
 # ######################################
 
-configureDHCP() {
+isNAT() {
 
-  [[ "$DEBUG" == [Yy1]* ]] && echo "Configuring MACVTAP networking..."
+  case "${NETWORK,,}" in
+    "nat" | "tap" | "tun" | "tuntap" | "y" | "" )
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+isUserMode() {
+
+  case "${NETWORK,,}" in
+    "passt" | "slirp" | "user"* )
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+getMTU() {
+
+  local dev="$1"
+
+  if [ -r "/sys/class/net/$dev/mtu" ]; then
+    cat "/sys/class/net/$dev/mtu"
+  else
+    echo "0"
+  fi
+
+  return 0
+}
+
+minMTU() {
+
+  local mtu min=""
+
+  for mtu in "$@"; do
+    [[ -z "$mtu" || "$mtu" == "0" ]] && continue
+
+    if [[ -z "$min" || "$mtu" -lt "$min" ]]; then
+      min="$mtu"
+    fi
+  done
+
+  echo "${min:-0}"
+  return 0
+}
+
+setMTU() {
+
+  local dev="$1"
+  local mtu="$2"
+
+  # MTU 0 means "do not set"; MTU 1500 is the normal default and does not need setting.
+  [[ "$mtu" == "0" || "$mtu" == "1500" ]] && return 0
+
+  if ! ip link set dev "$dev" mtu "$mtu"; then
+    warn "failed to set MTU size of $dev to $mtu."
+  fi
+
+  return 0
+}
+
+gatewayMAC() {
+
+  local mac="$1"
+
+  # Derive a stable locally administered gateway MAC from the guest MAC so the
+  # guest does not discover a different router on every start.
+  echo "$mac" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/'
+}
+
+maskToCIDR() {
+
+  local mask="$1"
+  local prefix
+
+  if ! command -v ipcalc > /dev/null 2>&1; then
+    error "Required command 'ipcalc' is not installed!"
+    return 1
+  fi
+
+  prefix=$(ipcalc -n -b "0.0.0.0/$mask" 2>/dev/null | awk '
+    /^Netmask:/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "=") {
+          print $(i + 1)
+          exit
+        }
+      }
+    }
+  ')
+
+  if [[ ! "$prefix" =~ ^[0-9]+$ ]] || (( prefix < 0 || prefix > 32 )); then
+    error "Invalid MASK: '$mask'"
+    return 1
+  fi
+
+  echo "$prefix"
+  return 0
+}
+
+networkCIDR() {
+
+  local ip="$1"
+  local network
+
+  network=$(ipcalc -n -b "$ip/$MASK" 2>/dev/null | awk '
+    /^Network:/ {
+      print $2
+      exit
+    }
+  ')
+
+  if [[ ! "$network" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$ ]]; then
+    error "Failed to calculate network address from IP '$ip' and netmask '$MASK'."
+    return 1
+  fi
+
+  echo "$network"
+  return 0
+}
+
+upstreamIP() {
+
+  local subnet="$1"
+  local guest="$2"
+  local gateway="$3"
+  local broadcast candidate last
+
+  broadcast=$(ipcalc -n -b "$subnet" 2>/dev/null | awk '
+    /^Broadcast:/ {
+      print $2
+      exit
+    }
+  ')
+
+  if [[ ! "$broadcast" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    return 1
+  fi
+
+  last="${broadcast##*.}"
+
+  # Reserve a high unused address for system.lan, avoiding the guest and bridge
+  # gateway addresses at the bottom of the subnet.
+  for (( last--; last>=2; last-- )); do
+    candidate="${broadcast%.*}.$last"
+    [[ "$candidate" == "$guest" || "$candidate" == "$gateway" ]] && continue
+
+    echo "$candidate"
+    return 0
+  done
+
+  return 1
+}
+
+detectInterface() {
+
+  if [ -n "$DEV" ]; then
+    return 0
+  fi
+
+  # Prefer the last attached Kubernetes network
+  [ -d "/sys/class/net/net0" ] && DEV="net0"
+  [ -d "/sys/class/net/net1" ] && DEV="net1"
+  [ -d "/sys/class/net/net2" ] && DEV="net2"
+  [ -d "/sys/class/net/net3" ] && DEV="net3"
+
+  # Automatically detect the default network interface
+  [ -z "$DEV" ] && DEV=$(awk '$2 == 00000000 { print $1; exit }' /proc/net/route)
+  [ -z "$DEV" ] && DEV="eth0"
+
+  return 0
+}
+
+formatAddress() {
+
+  local ip="${1:-}"
+  local prefix="${2:-}"
+  local result="$ip"
+
+  [ -z "$result" ] && return 1
+
+  if [ -n "$prefix" ] && [[ "$prefix" != "24" ]]; then
+    result+="/$prefix"
+  fi
+
+  echo "$result"
+  return 0
+}
+
+defaultGateway() {
+
+  ip -4 route list default dev "$1" 2>/dev/null |
+    awk '$1 == "default" { for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }' || :
+
+  return 0
+}
+
+detectAddresses() {
+
+  GATEWAY=$(defaultGateway "$DEV")
+  { UPLINK=$(ip address show dev "$DEV" | grep inet | awk '/inet / { print $2 }' | cut -f1 -d/ | head -n 1); } 2>/dev/null || :
+
+  IP6=""
+
+  if [ -f /proc/net/if_inet6 ] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" != "1" ]]; then
+    { IP6=$(ip -6 addr show dev "$DEV" scope global up); local rc=$?; } 2>/dev/null || :
+    (( rc != 0 )) && IP6=""
+    [ -n "$IP6" ] && IP6=$(echo "$IP6" | sed -e's/^.*inet6 \([^ ]*\)\/.*$/\1/;t;d' | head -n 1)
+  fi
+
+  return 0
+}
+
+detectAdapter() {
+
+  local result
+
+  NIC=""
+  BUS=""
+
+  result=$(ethtool -i "$DEV" 2>/dev/null || :)
+
+  NIC=$(awk -F':[[:space:]]*' '
+    tolower($1) == "driver" {
+      print $2
+      exit
+    }
+  ' <<< "$result")
+
+  BUS=$(awk -F':[[:space:]]*' '
+    tolower($1) == "bus-info" {
+      print $2
+      exit
+    }
+  ' <<< "$result")
+
+  return 0
+}
+
+canBindPrivilegedPort() {
+
+  local port="$1"
+  local proto="${2:-tcp}"
+  local start="1024"
+  local rc=1
+
+  [ -r /proc/sys/net/ipv4/ip_unprivileged_port_start ] &&
+    start=$(< /proc/sys/net/ipv4/ip_unprivileged_port_start)
+
+  (( port >= start )) && return 0
+
+  if [[ "$proto" == "udp" ]]; then
+    { timeout 0.1 nc -4 -n -d -u -l 127.0.0.1 "$port" > /dev/null 2>&1; rc=$?; } || :
+  else
+    { timeout 0.1 nc -4 -n -d -l 127.0.0.1 "$port" > /dev/null 2>&1; rc=$?; } || :
+  fi
+
+  (( rc == 124 ))
+}
+
+disableIPv6() {
+
+  local dev="$1"
+
+  [ -d "/proc/sys/net/ipv6/conf/$dev" ] || return 0
+
+  # Best-effort only: Docker/rootless/container sysctl writes can fail.
+  sysctl -w "net.ipv6.conf.$dev.disable_ipv6=1" > /dev/null 2>&1 || :
+  sysctl -w "net.ipv6.conf.$dev.accept_ra=0" > /dev/null 2>&1 || :
+
+  return 0
+}
+
+subnetInUse() {
+
+  local subnet="$1"
+  local broader narrower routes
+
+  if ! broader=$(ip -4 route show table all match "$subnet" 2>/dev/null); then
+    error "Failed to inspect existing routes for subnet $subnet."
+    return 2
+  fi
+
+  if ! narrower=$(ip -4 route show table all root "$subnet" 2>/dev/null); then
+    error "Failed to inspect existing routes for subnet $subnet."
+    return 2
+  fi
+
+  routes=$(
+    printf '%s\n%s\n' "$broader" "$narrower" |
+      grep -Ev '(^|[[:space:]])default([[:space:]]|$)' |
+      sort -u || true
+  )
+
+  [ -n "$routes" ]
+}
+
+guestIP() {
+
+  local ip="$1"
+  local min="${2:-2}"
+  local last="${ip##*.}"
+
+  if [[ ! "$last" =~ ^[0-9]+$ ]] || (( last < min || last > 254 )); then
+    ip="${ip%.*}.$min"
+  fi
+
+  echo "$ip"
+  return 0
+}
+
+natGuestIP() {
+
+  local ip="$1"
+  local guest subnet second third
+
+  third=$(cut -d. -f3 <<< "$ip")
+
+  if [[ "$ip" == "172.30."* ]]; then
+    local start="31"
+  else
+    local start="30"
+  fi
+
+  # Rotate through 172.30.0.0/16 to 172.254.0.0/16 and reject any candidate that
+  # overlaps an existing route inside the container.
+  for (( second=start; second<=254; second++ )); do
+    guest=$(guestIP "172.$second.$third.0" 2)
+    subnet=$(networkCIDR "$guest") || return 1
+
+    if subnetInUse "$subnet"; then
+      continue
+    else
+      local rc=$?
+      (( rc == 1 )) || return 1
+    fi
+
+    echo "$guest"
+    return 0
+  done
+
+  for (( second=30; second<start; second++ )); do
+    guest=$(guestIP "172.$second.$third.0" 2)
+    subnet=$(networkCIDR "$guest") || return 1
+
+    if subnetInUse "$subnet"; then
+      continue
+    else
+      local rc=$?
+      (( rc == 1 )) || return 1
+    fi
+
+    echo "$guest"
+    return 0
+  done
+
+  error "No available VM subnet found in 172.30.$third.0/$PREFIX through 172.254.$third.0/$PREFIX."
+  return 1
+}
+
+# ######################################
+#  DNS / port helpers
+# ######################################
+
+configureDNS() {
+
+  local fa="$1"
+  local ip="$2"
+  local mac="$3"
+  local host="$4"
+  local mask="$5"
+  local gateway="$6"
+  local upstream="${7:-}"
+  local arguments="$DNSMASQ_OPTS"
+  local pid
+
+  if ! echo "$gateway" > "$QEMU_DIR/qemu.gw"; then
+    error "Failed to write QEMU gateway file!"
+    return 1
+  fi
+
+  enabled "${DNSMASQ_DISABLE:-}" && return 0
+  enabled "$DEBUG" && echo "Starting dnsmasq daemon..."
+
+  if readPidFile pid "$DNSMASQ_PID"; then
+    pKill "$pid"
+  fi
+
+  rm -f "$DNSMASQ_PID"
+
+  if isNAT; then
+
+    # Create lease file for faster resolve
+    echo "0 $mac $ip $host 01:$mac" > /var/lib/misc/dnsmasq.leases || :
+    chmod 644 /var/lib/misc/dnsmasq.leases || :
+
+    # dnsmasq configuration:
+    arguments+=" --dhcp-authoritative"
+
+    # Set DHCP range and host
+    arguments+=" --dhcp-range=$ip,$ip"
+    arguments+=" --dhcp-host=$mac,,$ip,$host,1h"
+
+    # Set DNS server and gateway
+    arguments+=" --dhcp-option=option:netmask,$mask"
+    arguments+=" --dhcp-option=option:router,$gateway"
+    arguments+=" --dhcp-option=option:dns-server,$gateway"
+
+    # Set MTU through DHCP option 26
+    if [[ "$GUEST_MTU" != "0" && "$GUEST_MTU" != "1500" ]]; then
+      arguments+=" --dhcp-option=option:mtu,$GUEST_MTU"
+    fi
+
+  fi
+
+  # Set interfaces
+  arguments+=" --interface=$fa"
+  arguments+=" --bind-interfaces"
+
+  # Workaround NET_RAW capability
+  arguments+=" --no-ping"
+
+  # Add DNS entry for container
+  arguments+=" --address=/host.lan/$gateway"
+
+  # Add DNS entry for the upstream gateway.
+  if isNAT && [ -n "$upstream" ]; then
+    arguments+=" --address=/system.lan/$upstream"
+  fi
+
+  # Avoid returning IPv6 records when the active network mode is IPv4-only.
+  if isNAT || [ -z "$IP6" ]; then
+    arguments+=" --filter-AAAA"
+  fi
+
+  # Set local dns resolver to dnsmasq when needed
+  [ -f /etc/resolv.dnsmasq ] && arguments+=" --resolv-file=/etc/resolv.dnsmasq"
+
+  # Set pid file
+  arguments+=" --pid-file=$DNSMASQ_PID"
+
+  # Enable logging to file
+  local log="/var/log/dnsmasq.log"
+  rm -f "$log"
+  arguments+=" --log-facility=$log"
+
+  arguments=$(echo "$arguments" | sed 's/\t/ /g' | tr -s ' ' | sed 's/^ *//')
+  enabled "$DEBUG" && printf "Dnsmasq arguments:\n\n    %s\n\n" "${arguments// -/$'\n    -'}"
+
+  { $DNSMASQ ${arguments:+ $arguments}; local rc=$?; } || :
+
+  if (( rc != 0 )); then
+
+    local msg="Failed to start Dnsmasq, reason: $rc"
+
+    if [[ "${NETWORK,,}" == "slirp" || "${NETWORK,,}" == "passt" ]] || ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+      [ -f "$log" ] && [ -s "$log" ] && cat "$log"
+      error "$msg"
+    fi
+
+    return 1
+  fi
+
+  if enabled "$DNSMASQ_DEBUG"; then
+    tail -fn +0 "$log" --pid=$$ &
+  fi
+
+  return 0
+}
+
+normalizePorts() {
+
+  local list="$1"
+  local mode="${2:-tcp}"
+  local port num
+  local ports=""
+
+  for port in ${list//,/ }; do
+
+    [ -z "$port" ] && continue
+
+    case "$mode" in
+      "tcp" )
+        [[ "$port" == *"/udp" ]] && continue
+        num="${port%/tcp}"
+        [ -n "$num" ] && ports+="$num,"
+        ;;
+      "all" )
+        if [[ "$port" == *"/udp" ]]; then
+          num="${port%/udp}"
+          [ -n "$num" ] && ports+="$num/udp,"
+        else
+          num="${port%/tcp}"
+          [ -n "$num" ] && ports+="$num/tcp,"
+        fi
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+
+  done
+
+  # Remove duplicates
+  echo "${ports//,,/,}," | awk 'BEGIN{RS=ORS=","} !seen[$0]++' | sed 's/,*$//g'
+
+  return 0
+}
+
+getReservedPorts() {
+
+  local list=""
+  local mode="${1:-tcp}"
+  local display="${DISPLAY:-}"
+  local port
+
+  # Reserve the DNS port while the internal dnsmasq resolver is active.
+  if ! enabled "${DNSMASQ_DISABLE:-}" && ! isNAT; then
+    list+="53/tcp,53/udp,"
+  fi
+
+  # Reserve ports used directly by the configured QEMU display.
+  if [[ "${display,,}" == "vnc" || "${display,,}" == "web" ]]; then
+    [ -n "${VNC_PORT:-}" ] && list+="$VNC_PORT/tcp,"
+  fi
+
+  # Reserve the public web server port.
+  if ! disabled "${WEB:-}" && [ -n "${WEB_PORT:-}" ]; then
+    list+="$WEB_PORT/tcp,"
+  fi
+
+  # Reserve ports the user specified for monitoring.
+  for port in "${SERIAL:-}" "${MONITOR:-}" "${QMP:-}" "${QGA:-}"; do
+    port=$(strip "$port")
+    [[ "$port" =~ ^[0-9]+$ ]] && list+="$port/tcp,"
+  done
+
+  normalizePorts "$list" "$mode"
+  return $?
+}
+
+getCustomHostPorts() {
+
+  local mode="${1:-tcp}"
+  local reserved user port
+  local ports=""
+
+  reserved=$(getReservedPorts "all")
+  user=$(normalizePorts "$HOST_PORTS" "all")
+
+  for port in ${user//,/ }; do
+    [[ ",$reserved," == *",$port,"* ]] && continue
+    ports+="$port,"
+  done
+
+  normalizePorts "$ports" "$mode"
+  return $?
+}
+
+getHostPorts() {
+
+  local mode="${1:-tcp}"
+  local reserved custom
+
+  # Merge internal reservations with user-defined host ports without mutating HOST_PORTS.
+  # User entries already covered by an internal reservation are silently ignored.
+  reserved=$(getReservedPorts "all")
+  custom=$(getCustomHostPorts "all")
+
+  normalizePorts "$reserved,$custom" "$mode"
+  return $?
+}
+
+getUserPorts() {
+
+  # User-mode networking exposes SSH by default, or RDP over both TCP and UDP for
+  # Windows, while excluding ports already owned by the container.
+  local defaults="22"
+  [[ "${BOOT_MODE:-}" == "windows"* ]] && defaults="3389/tcp,3389/udp"
+  local list="$defaults,${USER_PORTS// /},"
+
+  local ports=""
+  local userport hostport exclude reserved
+
+  reserved=$(getReservedPorts "all")
+  exclude=$(getHostPorts "all")
+
+  for userport in ${list//,/ }; do
+
+    local proto="tcp"
+    local num="$userport"
+
+    if [[ "$userport" == *"/udp" ]]; then
+      proto="udp"
+      num="${userport%/udp}"
+    elif [[ "$userport" == *"/tcp" ]]; then
+      proto="tcp"
+      num="${userport%/tcp}"
+    fi
+
+    [ -z "$num" ] && continue
+
+    for hostport in ${exclude//,/ }; do
+
+      if [[ "$num/$proto" == "$hostport" ]]; then
+
+        if [[ ",$reserved," == *",$hostport,"* ]]; then
+          warn "Could not assign port $hostport to \"USER_PORTS\" because it is reserved by the container!"
+        else
+          warn "Could not assign port $hostport to \"USER_PORTS\" because it is already in \"HOST_PORTS\"!"
+        fi
+
+        num=""
+        break
+      fi
+
+    done
+
+    [ -z "$num" ] && continue
+
+    if ! canBindPrivilegedPort "$num" "$proto"; then
+      warn "Could not assign port $num/$proto to \"USER_PORTS\" because it cannot be bound by the current user!"
+      continue
+    fi
+
+    ports+="$num/$proto,"
+  done
+
+  # Remove duplicates
+  echo "${ports//,,/,}," | awk 'BEGIN{RS=ORS=","} !seen[$0]++' | sed 's/,*$//g'
+
+  return 0
+}
+
+getSlirp() {
+
+  local ip="$1"
+  local args="" list
+
+  list=$(getUserPorts)
+
+  for port in ${list//,/ }; do
+
+    local proto="tcp"
+    local num="${port%/tcp}"
+    [ -z "$num" ] && continue
+
+    if [[ "$port" == *"/udp" ]]; then
+      proto="udp"
+      num="${port%/udp}"
+    fi
+
+    args+="hostfwd=$proto::$num-$ip:$num,"
+  done
+
+  echo "$args" | sed 's/,*$//g'
+  return 0
+}
+
+getPasst() {
+
+  local list port
+  local tcp="" udp="" args=""
+
+  list=$(getUserPorts)
+
+  for port in ${list//,/ }; do
+
+    [ -z "$port" ] && continue
+
+    if [[ "$port" == *"/udp" ]]; then
+
+      local num="${port%/udp}"
+      [ -n "$num" ] && udp+="$num,"
+
+    elif [[ "$port" == *"/tcp" ]]; then
+
+      local num="${port%/tcp}"
+      [ -n "$num" ] && tcp+="$num,"
+
+    else
+
+      tcp+="$port,"
+
+    fi
+
+  done
+
+  tcp="${tcp%,}"
+  udp="${udp%,}"
+
+  [ -n "$tcp" ] && args+=" -t $tcp"
+  [ -n "$udp" ] && args+=" -u $udp"
+
+  echo "$args"
+  return 0
+}
+
+# ######################################
+#  Network mode setup
+# ######################################
+
+configureVTAP() {
+
+  local msg dev
+
+  enabled "$DEBUG" && echo "Configuring MACVTAP networking..."
 
   # Create the necessary file structure for /dev/vhost-net
   if [ ! -c /dev/vhost-net ]; then
@@ -49,14 +770,14 @@ configureDHCP() {
   fi
 
   # Create a macvtap network for the VM guest
-  { msg=$(ip link add link "$VM_NET_DEV" name "$VM_NET_TAP" address "$VM_NET_MAC" type macvtap mode bridge 2>&1); rc=$?; } || :
+  { msg=$(ip link add link "$DEV" name "$TAP" address "$MAC" type macvtap mode bridge 2>&1); local rc=$?; } || :
 
   case "$msg" in
     "RTNETLINK answers: File exists"* )
-      while ! ip link add link "$VM_NET_DEV" name "$VM_NET_TAP" address "$VM_NET_MAC" type macvtap mode bridge; do
+      while ! ip link add link "$DEV" name "$TAP" address "$MAC" type macvtap mode bridge; do
         info "Waiting for macvtap interface to become available.."
         sleep 5
-      done  ;;
+      done ;;
     "RTNETLINK answers: Invalid argument"* )
       error "Cannot create macvtap interface. Please make sure that the network type of the container is 'macvlan' and not 'ipvlan'."
       return 1 ;;
@@ -71,33 +792,54 @@ configureDHCP() {
       fi ;;
   esac
 
-  if [[ "$MTU" != "0" && "$MTU" != "1500" ]]; then
-    if ! ip link set dev "$VM_NET_TAP" mtu "$MTU"; then
-      warn "Failed to set MTU size to $MTU."
-    fi
+  if [[ "$GUEST_MTU" != "0" ]]; then
+    setMTU "$TAP" "$GUEST_MTU"
+    GUEST_MTU=$(minMTU "$GUEST_MTU" "$(getMTU "$TAP")")
   fi
 
-  while ! ip link set "$VM_NET_TAP" up; do
-    info "Waiting for MAC address $VM_NET_MAC to become available..."
+  while ! ip link set "$TAP" up; do
+    info "Waiting for MAC address $MAC to become available..."
     info "If you cloned this machine, please delete the '$PROCESS.mac' file to generate a different MAC address."
     sleep 2
   done
 
-  local TAP_NR TAP_PATH MAJOR MINOR
-  TAP_NR=$(</sys/class/net/"$VM_NET_TAP"/ifindex)
-  TAP_PATH="/dev/tap${TAP_NR}"
+  local TAP_NR MAJOR MINOR
+
+  if ! dev=$(cat /sys/devices/virtual/net/"$TAP"/tap*/dev); then
+    error "Failed to determine device numbers for MACVTAP interface \"$TAP\" !"
+    return 1
+  fi
+
+  IFS=: read -r MAJOR MINOR <<< "$dev"
+
+  if [[ ! "$MAJOR" =~ ^[0-9]+$ || ! "$MINOR" =~ ^[0-9]+$ ]]; then
+    error "Failed to parse device numbers for MACVTAP interface \"$TAP\" !"
+    return 1
+  fi
+
+  if (( MAJOR < 1 )); then
+    error "Cannot find: sys/devices/virtual/net/$TAP"
+    return 1
+  fi
+
+  if ! TAP_NR=$(<"/sys/class/net/$TAP/ifindex"); then
+    error "Failed to determine interface index of MACVTAP interface \"$TAP\" !"
+    return 1
+  fi
 
   # Create dev file (there is no udev in container: need to be done manually)
-  IFS=: read -r MAJOR MINOR < <(cat /sys/devices/virtual/net/"$VM_NET_TAP"/tap*/dev)
-  (( MAJOR < 1)) && error "Cannot find: sys/devices/virtual/net/$VM_NET_TAP" && return 1
+  local TAP_PATH="/dev/tap${TAP_NR}"
 
-  [[ ! -e "$TAP_PATH" && -e "/dev0/${TAP_PATH##*/}" ]] && ln -s "/dev0/${TAP_PATH##*/}" "$TAP_PATH"
+  [[ ! -e "$TAP_PATH" && -e "/dev0/${TAP_PATH##*/}" ]] &&
+    ln -s "/dev0/${TAP_PATH##*/}" "$TAP_PATH"
 
   if [[ ! -e "$TAP_PATH" ]]; then
-    { mknod "$TAP_PATH" c "$MAJOR" "$MINOR" ; rc=$?; } || :
+    { mknod "$TAP_PATH" c "$MAJOR" "$MINOR"; rc=$?; } || :
     (( rc != 0 )) && error "Cannot mknod: $TAP_PATH ($rc)" && return 1
   fi
 
+  # Keep the macvtap and vhost file descriptors open in this shell so QEMU can
+  # inherit them by their fixed descriptor numbers.
   { exec 30>>"$TAP_PATH"; rc=$?; } 2>/dev/null || :
 
   if (( rc != 0 )); then
@@ -115,312 +857,132 @@ configureDHCP() {
   return 0
 }
 
-configureDNS() {
-
-  local if="$1"
-  local ip="$2"
-  local mac="$3"
-  local host="$4"
-  local mask="$5"
-  local gateway="$6"
-  local arguments="$DNSMASQ_OPTS"
-
-  [[ "${DNSMASQ_DISABLE:-}" == [Yy1]* ]] && return 0
-  [[ "$DEBUG" == [Yy1]* ]] && echo "Starting dnsmasq daemon..."
-
-  [ -s "$DNSMASQ_PID" ] && pKill "$(<"$DNSMASQ_PID")"
-  rm -f "$DNSMASQ_PID"
-
-  case "${NETWORK,,}" in
-    "tap" | "tun" | "tuntap" | "y" )
-
-      # Create lease file for faster resolve
-      echo "0 $mac $ip $host 01:$mac" > /var/lib/misc/dnsmasq.leases
-      chmod 644 /var/lib/misc/dnsmasq.leases
-
-      # dnsmasq configuration:
-      arguments+=" --dhcp-authoritative"
-
-      # Set DHCP range and host
-      arguments+=" --dhcp-range=$ip,$ip"
-      arguments+=" --dhcp-host=$mac,,$ip,$host,infinite"
-
-      # Set DNS server and gateway
-      arguments+=" --dhcp-option=option:netmask,$mask"
-      arguments+=" --dhcp-option=option:router,$gateway"
-      arguments+=" --dhcp-option=option:dns-server,$gateway"
-
-  esac
-
-  # Set interfaces
-  arguments+=" --interface=$if"
-  arguments+=" --bind-interfaces"
-
-  # Add DNS entry for container
-  arguments+=" --address=/host.lan/$gateway"
-
-  # Set local dns resolver to dnsmasq when needed
-  [ -f /etc/resolv.dnsmasq ] && arguments+=" --resolv-file=/etc/resolv.dnsmasq"
-
-  # Enable logging to file
-  local log="/var/log/dnsmasq.log"
-  rm -f "$log"
-  arguments+=" --log-facility=$log"
-
-  arguments=$(echo "$arguments" | sed 's/\t/ /g' | tr -s ' ' | sed 's/^ *//')
-  [[ "$DEBUG" == [Yy1]* ]] && printf "Dnsmasq arguments:\n\n%s\n\n" "${arguments// -/$'\n-'}"
-
-  if ! $DNSMASQ ${arguments:+ $arguments}; then
-
-    local msg="Failed to start Dnsmasq, reason: $?"
-
-    if [[ "${NETWORK,,}" == "slirp" || "${NETWORK,,}" == "passt" || "$ROOTLESS" != [Yy1]* || "$DEBUG" == [Yy1]* ]]; then
-      [ -f "$log" ] && [ -s "$log" ] && cat "$log"
-      error "$msg"
-    fi
-
-    return 1
-  fi
-
-  if [[ "$DNSMASQ_DEBUG" == [Yy1]* ]]; then
-    tail -fn +0 "$log" --pid=$$ &
-  fi
-
-  return 0
-}
-
-compat() {
-
-  local gateway="$1"
-  local interface="$2"
-  local label="compat"
-  local samba="20.20.20.1"
-  local err="failed to configure IP alias for backwards compatibility."
-
-  [[ "$samba" == "$gateway" ]] && return 0
-  [[ "${BOOT_MODE:-}" != "windows"* ]] && return 0
-
-  if [[ "$interface" != "${interface:0:9}" ]]; then
-    label="c"
-    if [[ "$interface" != "${interface:14}" ]]; then
-      warn "$err Interface name \"$interface\" exceeds 14 characters!" && return 0
-    fi
-  fi
-
-  # Backwards compatibility with old installations
-  if ip address add dev "$interface" "$samba/24" label "$interface:$label" 2>/dev/null; then
-    SAMBA_INTERFACE="$samba"
-  else
-    msg=$(ip address add dev "$interface" "$samba/24" label "$interface:$label" 2>&1)
-    if [[ "${msg,,}" != *"address already assigned"* ]]; then
-      if [[ "$ROOTLESS" != [Yy1]* || "$DEBUG" == [Yy1]* ]]; then
-        echo "$msg" >&2
-        warn "$err $ADD_ERR --cap-add NET_ADMIN"
-      fi
-    fi
-  fi
-
-  return 0
-}
-
-getHostPorts() {
-
-  local list=""
-
-  if [[ "${DISPLAY,,}" == "web" ]]; then
-    list+="$WSS_PORT,"
-  fi
-
-  if [[ "${DISPLAY,,}" == "vnc" || "${DISPLAY,,}" == "web" ]]; then
-    list+="$VNC_PORT,"
-  fi
-
-  list+="$MON_PORT,"
-
-  if [[ "${WEB:-}" != [Nn]* ]]; then
-    list+="$WEB_PORT,"
-    list+="$WSD_PORT,"
-  fi
-
-  list+="${HOST_PORTS// /},"
-
-  # Remove duplicates
-  list=$(echo "${list//,,/,}," | awk 'BEGIN{RS=ORS=","} !seen[$0]++' | sed 's/,*$//g')
-
-  echo "$list"
-  return 0
-}
-
-getUserPorts() {
-
-  local ssh="22"
-  [[ "${BOOT_MODE:-}" == "windows"* ]] && ssh="3389"
-
-  local list="$ssh,"
-  list+="${USER_PORTS// /},"
-
-  local exclude
-  exclude=$(getHostPorts)
-
-  local ports=""
-  local userport=""
-  local hostport=""
-
-  for userport in ${list//,/ }; do
-
-    local num="${userport///tcp}"
-    num="${num///udp}"
-
-    for hostport in ${exclude//,/ }; do
-
-      local port="${hostport///tcp}"
-      port="${port///udp}"
-
-      if [[ "$num" == "$port" ]]; then
-        num=""
-        if [[ "$port" != "$WEB_PORT" ]]; then
-          warn "Could not assign port $port to \"USER_PORTS\" because it is already in \"HOST_PORTS\"!"
-        fi
-      fi
-
-    done
-
-    [ -n "$num" ] && ports+="$userport,"
-
-  done
-
-  # Remove duplicates
-  ports=$(echo "${ports//,,/,}," | awk 'BEGIN{RS=ORS=","} !seen[$0]++' | sed 's/,*$//g')
-
-  echo "$ports"
-  return 0
-}
-
-getSlirp() {
-
-  local args=""
-  local list=""
-
-  list=$(getUserPorts)
-
-  for port in ${list//,/ }; do
-
-    local proto="tcp"
-    local num="${port%/tcp}"
-    [ -z "$num" ] && continue
-
-    if [[ "$port" == *"/udp" ]]; then
-      proto="udp"
-      num="${port%/udp}"
-    elif [[ "$port" != *"/tcp" ]]; then
-      args+="hostfwd=$proto::$num-$VM_NET_IP:$num,"
-      proto="udp"
-      num="${port%/udp}"
-    fi
-
-    args+="hostfwd=$proto::$num-$VM_NET_IP:$num,"
-  done
-
-  args=$(echo "$args" | sed 's/,*$//g')
-
-  echo "${args%?}"
-  return 0
-}
-
 configureSlirp() {
 
   NETWORK="slirp"
-  [[ "$DEBUG" == [Yy1]* ]] && echo "Configuring slirp networking..."
+  enabled "$DEBUG" && echo "Configuring slirp networking..."
 
-  local ip="$IP"
-  [ -n "$VM_NET_IP" ] && ip="$VM_NET_IP"
-  local base="${ip%.*}."
-  [ "${ip/$base/}" -lt "4" ] && ip="${ip%.*}.4"
+  local ip="$UPLINK"
+  [ -n "$IP" ] && ip="$IP"
+
+  ip=$(guestIP "$ip" 4)
   local gateway="${ip%.*}.1"
+  local subnet
+  subnet=$(networkCIDR "$ip") || return 1
 
   # Backwards compatibility
-  compat "$gateway" "$VM_NET_DEV" || :
+  compat "$gateway" "$DEV" || :
 
-  local ipv6=""
+  local ipv6="ipv6=off,"
   [ -n "$IP6" ] && ipv6="ipv6=on,"
 
-  NET_OPTS="-netdev user,id=hostnet0,ipv4=on,host=$gateway,net=${gateway%.*}.0/24,dhcpstart=$ip,${ipv6}hostname=$VM_NET_HOST"
+  NET_OPTS="-netdev user,id=hostnet0,ipv4=on,host=$gateway,net=$subnet,dhcpstart=$ip,${ipv6}hostname=$HOST"
 
-  local forward=""
-  forward=$(getSlirp)
+  local forward
+  forward=$(getSlirp "$ip")
   [ -n "$forward" ] && NET_OPTS+=",$forward"
 
-  if [[ "${DNSMASQ_DISABLE:-}" != [Yy1]* ]]; then
-    [ ! -f /etc/resolv.dnsmasq ] && cp /etc/resolv.conf /etc/resolv.dnsmasq
-    configureDNS "lo" "$ip" "$VM_NET_MAC" "$VM_NET_HOST" "$VM_NET_MASK" "$gateway" || return 1
-    echo -e "nameserver 127.0.0.1\nsearch .\noptions ndots:0" >/etc/resolv.conf
+  if enabled "${DNSMASQ_DISABLE:-}"; then
+    if ! echo "$gateway" > "$QEMU_DIR/qemu.gw"; then
+      error "Failed to write QEMU gateway file!"
+      return 1
+    fi
+  else
+    # Preserve the original resolver, then point the container at local dnsmasq so
+    # host.lan resolves consistently for both the guest and helper processes.
+    if [ ! -f /etc/resolv.dnsmasq ] && ! cp /etc/resolv.conf /etc/resolv.dnsmasq; then
+      error "Failed to backup /etc/resolv.conf."
+      return 1
+    fi
+
+    configureDNS "lo" "$ip" "$MAC" "$HOST" "$MASK" "$gateway" || return 1
+
+    if ! printf '%s\n' \
+      'nameserver 127.0.0.1' \
+      'search .' \
+      'options ndots:0' > /etc/resolv.conf; then
+      error "Failed to update /etc/resolv.conf."
+      return 1
+    fi
   fi
 
-  VM_NET_IP="$ip"
+  IP="$ip"
   return 0
 }
 
 configurePasst() {
 
   NETWORK="passt"
-  [[ "$DEBUG" == [Yy1]* ]] && echo "Configuring user-mode networking..."
+  enabled "$DEBUG" && echo "Configuring user-mode networking..."
 
   local log="/var/log/passt.log"
   rm -f "$log"
 
-  local ip="$IP"
-  [ -n "$VM_NET_IP" ] && ip="$VM_NET_IP"
+  local ip="$UPLINK"
+  [ -n "$IP" ] && ip="$IP"
 
-  local gateway=""
-  if [[ "$ip" != *".1" ]]; then
-    gateway="${ip%.*}.1"
-  else
-    gateway="${ip%.*}.2"
-  fi
+  ip=$(guestIP "$ip" 2)
+  local gateway="${ip%.*}.1"
 
   # Backwards compatibility
-  compat "$gateway" "$VM_NET_DEV" || :
+  compat "$gateway" "$DEV" || :
 
   # passt configuration:
   [ -z "$IP6" ] && PASST_OPTS+=" -4"
 
   PASST_OPTS+=" -a $ip"
   PASST_OPTS+=" -g $gateway"
-  PASST_OPTS+=" -n $VM_NET_MASK"
-  [ -n "$PASST_MTU" ] && PASST_OPTS+=" -m $PASST_MTU"
+  PASST_OPTS+=" -n $MASK"
 
-  local forward=""
-  forward=$(getUserPorts)
-  forward="${forward///tcp}"
-  forward="${forward///udp}"
+  local passt_mtu="$GUEST_MTU"
+  [[ "$passt_mtu" == "0" ]] && passt_mtu="1500"
 
-  if [ -n "$forward" ]; then
-    forward="%${VM_NET_DEV}/$forward"
-    PASST_OPTS+=" -t $forward"
-    PASST_OPTS+=" -u $forward"
-  fi
+  # Pass an explicit MTU to passt.
+  PASST_OPTS+=" -m $passt_mtu"
 
-  PASST_OPTS+=" -H $VM_NET_HOST"
+  local forward
+  forward=$(getPasst)
+  [ -n "$forward" ] && PASST_OPTS+="$forward"
+
+  PASST_OPTS+=" -H $HOST"
   PASST_OPTS+=" -M $GATEWAY_MAC"
-  PASST_OPTS+=" -P  $PASST_PID"
+  PASST_OPTS+=" --runas $EUID:$(id -g)"
+  PASST_OPTS+=" -P $PASST_PID"
+  PASST_OPTS+=" -s $PASST_SOCKET"
   PASST_OPTS+=" -l $log"
   PASST_OPTS+=" -q"
 
-  if [[ "${DNSMASQ_DISABLE:-}" != [Yy1]* ]]; then
-    [ ! -f /etc/resolv.dnsmasq ] && cp /etc/resolv.conf /etc/resolv.dnsmasq
-    echo -e "nameserver 127.0.0.1\nsearch .\noptions ndots:0" >/etc/resolv.conf
+  if ! enabled "${DNSMASQ_DISABLE:-}"; then
+    if [ ! -f /etc/resolv.dnsmasq ] && ! cp /etc/resolv.conf /etc/resolv.dnsmasq; then
+      error "Failed to backup /etc/resolv.conf."
+      return 1
+    fi
+
+    if ! printf '%s\n' \
+      'nameserver 127.0.0.1' \
+      'search .' \
+      'options ndots:0' > /etc/resolv.conf; then
+      error "Failed to update /etc/resolv.conf."
+      return 1
+    fi
   fi
 
   PASST_OPTS=$(echo "$PASST_OPTS" | sed 's/\t/ /g' | tr -s ' ' | sed 's/^ *//')
-  [[ "$DEBUG" == [Yy1]* ]] && printf "Passt arguments:\n\n%s\n\n" "${PASST_OPTS// -/$'\n-'}"
+
+  if enabled "$DEBUG" || enabled "$PASST_DEBUG"; then
+    printf "Passt arguments:\n\n%s\n\n" "${PASST_OPTS// -/$'\n-'}"
+  fi
 
   [ ! -f "$PASST" ] && cp /usr/bin/passt* /run
 
-  if ! $PASST ${PASST_OPTS:+ $PASST_OPTS} >/dev/null 2>&1; then
+  # Try passt quietly first; on failure rerun without quiet mode to capture a
+  # useful diagnostic before deciding whether to fall back to slirp.
+  if ! "$PASST" ${PASST_OPTS:+$PASST_OPTS} >/dev/null 2>&1; then
 
     rm -f "$log"
+
     PASST_OPTS="${PASST_OPTS/ -q/}"
-    { $PASST ${PASST_OPTS:+ $PASST_OPTS}; rc=$?; } || :
+    { "$PASST" ${PASST_OPTS:+$PASST_OPTS}; local rc=$?; } || :
 
     if (( rc != 0 )); then
       [ -f "$log" ] && [ -s "$log" ] && cat "$log"
@@ -430,237 +992,972 @@ configurePasst() {
 
   fi
 
-  if [[ "$PASST_DEBUG" == [Yy1]* ]]; then
+  if enabled "$PASST_DEBUG"; then
     tail -fn +0 "$log" --pid=$$ &
-  else
-    if [[ "$DEBUG" == [Yy1]* ]]; then
-      [ -f "$log" ] && [ -s "$log" ] && cat "$log" && echo ""
+  elif enabled "$DEBUG"; then
+    [ -f "$log" ] && [ -s "$log" ] && cat "$log" && echo ""
+  fi
+
+  NET_OPTS="-netdev stream,id=hostnet0,server=off,addr.type=unix,addr.path=$PASST_SOCKET"
+
+  if ! configureDNS "lo" "$ip" "$MAC" "$HOST" "$MASK" "$gateway"; then
+    mKill "$PASST_PID"
+    rm -f "$PASST_PID" "$PASST_SOCKET"
+    return 1
+  fi
+
+  IP="$ip"
+  return 0
+}
+
+configureBridge() {
+
+  local file="/etc/qemu/bridge.conf"
+
+  [ -e "$file" ] && return 0
+  mkdir -p "${file%/*}" || return 0
+  echo "allow br0" > "$file" || return 0
+
+  return 0
+}
+
+createBridge() {
+
+  local gateway="$1"
+  local msg
+
+  # Create a bridge with a static IP for the VM guest
+  { msg=$(ip link add dev "$BRIDGE" type bridge 2>&1); local rc=$?; } || :
+
+  if (( rc != 0 )); then
+    enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+    [ -n "$msg" ] && echo "$msg" >&2
+
+    case "${msg,,}" in
+      *"operation not permitted"* | *"permission denied"* )
+        warn "failed to create bridge. $ADD_ERR --cap-add NET_ADMIN" ;;
+      * )
+        warn "failed to create bridge." ;;
+    esac
+
+    return 1
+  fi
+
+  if [[ "$GUEST_MTU" != "0" ]]; then
+    setMTU "$BRIDGE" "$GUEST_MTU"
+  fi
+
+  if ! ip address add "$gateway/$PREFIX" dev "$BRIDGE"; then
+    warn "failed to add IP address pool!" && return 1
+  fi
+
+  # Backwards compatibility
+  compat "$gateway" "$BRIDGE" || :
+
+  while ! ip link set "$BRIDGE" up; do
+    info "Waiting for IP address to become available..."
+    sleep 2
+  done
+
+  # NAT networking is IPv4-only; disable IPv6 on the guest bridge if possible.
+  disableIPv6 "$BRIDGE"
+
+  return 0
+}
+
+createTap() {
+
+  local tuntap="$1"
+  local msg
+
+  # Set tap to the bridge created
+  { msg=$(ip tuntap add dev "$TAP" mode tap 2>&1); local rc=$?; } || :
+
+  if (( rc != 0 )); then
+    enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+    [ -n "$msg" ] && echo "$msg" >&2
+    warn "$tuntap"
+    return 1
+  fi
+
+  if [[ "$GUEST_MTU" != "0" ]]; then
+    setMTU "$TAP" "$GUEST_MTU"
+  fi
+
+  if ! ip link set dev "$TAP" address "$GATEWAY_MAC"; then
+    warn "failed to set gateway MAC address."
+  fi
+
+  while ! ip link set "$TAP" up promisc on; do
+    info "Waiting for TAP to become available..."
+    sleep 2
+  done
+
+  # NAT networking is IPv4-only; disable IPv6 on the guest tap if possible.
+  disableIPv6 "$TAP"
+
+  if ! ip link set dev "$TAP" master "$BRIDGE"; then
+    warn "failed to set master bridge!" && return 1
+  fi
+
+  return 0
+}
+
+# ######################################
+#  IP tables
+# ######################################
+
+hasTable() {
+
+  iptables -t "$1" -S > /dev/null 2>&1
+}
+
+getTablesBackend() {
+
+  local version
+  version=$(iptables --version 2>/dev/null || true)
+
+  case "$version" in
+    *nf_tables* ) echo "nft" ;;
+    *legacy* ) echo "legacy" ;;
+    * ) return 1 ;;
+  esac
+}
+
+setTables() {
+
+  local mode="$1"
+  local path
+
+  path=$(command -v "iptables-$mode" 2>/dev/null || true)
+  [ -z "$path" ] && return 1
+
+  update-alternatives --set iptables "$path" > /dev/null 2>&1
+}
+
+showRules() {
+
+  local table="$1"
+  local chain="$2"
+  local label="$3"
+  local rule_tag="$4"
+  local rules
+  local own_rule="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
+
+  enabled "$DEBUG" || return 0
+
+  rules=$(
+    iptables -t "$table" -S "$chain" 2>/dev/null |
+      awk '$1 == "-A"' |
+      grep -Ev -- "$own_rule" || true
+  )
+
+  [ -n "$rules" ] || return 0
+
+  printf "Existing %s rules:\n\n%s\n\n" "$label" "$rules"
+  return 0
+}
+
+checkExistingTables() {
+
+  local rules conflicts
+  local rule_tag="QEMU_DNAT"
+  local own_rule="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
+
+  rules=$(
+    {
+      iptables -t nat -S PREROUTING 2>/dev/null || true
+      iptables -t nat -S OUTPUT 2>/dev/null || true
+    } |
+      awk '$1 == "-A"' |
+      grep -Ev -- "$own_rule" || true
+  )
+
+  conflicts=$(grep -E -- \
+    '^-A (PREROUTING|OUTPUT) .*(-j DNAT|-j REDIRECT)( |$)' \
+    <<< "$rules" || true)
+
+  if [ -n "$conflicts" ]; then
+    local msg="your existing NAT rules may take precedence over VM port forwarding"
+
+    if enabled "$DEBUG"; then
+      warn "${msg}."
+    else
+      warn "${msg}; enable DEBUG=Y to inspect them."
     fi
   fi
 
-  NET_OPTS="-netdev stream,id=hostnet0,server=off,addr.type=unix,addr.path=/tmp/passt_1.socket"
+  rules=$(
+    iptables -t filter -S FORWARD 2>/dev/null |
+      awk '$1 == "-A"' |
+      grep -Ev -- "$own_rule" || true
+  )
 
-  configureDNS "lo" "$ip" "$VM_NET_MAC" "$VM_NET_HOST" "$VM_NET_MASK" "$gateway" || return 1
+  conflicts=$(grep -E -- \
+    '^-A FORWARD .*(-j DROP|-j REJECT)( |$)' \
+    <<< "$rules" || true)
 
-  VM_NET_IP="$ip"
+  if [ -n "$conflicts" ]; then
+    local msg="your existing firewall rules may block traffic forwarded to or from the VM"
+
+    if enabled "$DEBUG"; then
+      warn "${msg}."
+    else
+      warn "${msg}; enable DEBUG=Y to inspect them."
+    fi
+  fi
+
+  showRules nat PREROUTING "NAT PREROUTING" "$rule_tag"
+  showRules nat OUTPUT "NAT OUTPUT" "$rule_tag"
+  showRules filter FORWARD "filter FORWARD" "$rule_tag"
+  showRules nat POSTROUTING "NAT POSTROUTING" "$rule_tag"
+
+  if hasTable mangle; then
+    showRules mangle FORWARD "mangle FORWARD" "$rule_tag"
+    showRules mangle POSTROUTING "mangle POSTROUTING" "$rule_tag"
+  else
+    warn "the mangle iptable is unavailable, so checksum correction and TCP MSS clamping rules will be skipped."
+  fi
+
+  return 0
+}
+
+runTableRule() {
+
+  local silent="$1"
+  local result="$2"
+  local msg
+
+  shift 2
+
+  printf -v "$result" '%s' ""
+
+  { msg=$("$@" 2>&1); local rc=$?; } || :
+  (( rc == 0 )) && return 0
+
+  printf -v "$result" '%s' "$msg"
+
+  if ! enabled "$silent" || enabled "$DEBUG"; then
+    [ -n "$msg" ] && echo "$msg" >&2
+  fi
+
+  return 1
+}
+
+tableError() {
+
+  local silent="$1"
+  local message="${2,,}"
+
+  if enabled "$silent" && ! enabled "$DEBUG"; then
+    return 1
+  fi
+
+  case "$message" in
+    *"permission denied"* | *"operation not permitted"* )
+      warn "IP tables access was denied. Add the NET_ADMIN capability or use user-mode networking."
+      ;;
+    *"table does not exist"* | *"can't initialize iptables table"* )
+      warn "The required IP tables kernel modules may be unavailable. Try: sudo modprobe ip_tables iptable_nat"
+      ;;
+    *"no chain/target/match by that name"* )
+      warn "A required IP tables target or match is unavailable in the host kernel."
+      ;;
+    *"could not fetch rule set generation id"* )
+      warn "The nftables backend is unavailable or inaccessible in this container."
+      ;;
+    * )
+      warn "Failed to configure IP tables. Verify NET_ADMIN access and host IP tables support."
+      ;;
+  esac
+
+  return 1
+}
+
+showTableCleanupError() {
+
+  local command="$1"
+  local message="$2"
+
+  enabled "$DEBUG" || return 0
+
+  printf "Failed IP tables cleanup command:\n\n%s\n\n" "$command" >&2
+  [ -n "$message" ] && printf "%s\n\n" "$message" >&2
+
+  return 0
+}
+
+applyTables() {
+
+  local ip="$1"
+  local subnet="$2"
+  local silent="${3:-N}"
+  local exclude port
+  local table_error
+  local dnat_chain="QEMU_DNAT"
+  local rule_tag="$dnat_chain"
+
+  exclude=$(getHostPorts)
+
+  # NAT traffic from the VM subnet leaving through any external interface.
+  if ! runTableRule "$silent" table_error \
+    iptables -t nat -A POSTROUTING \
+    ! -o "$BRIDGE" \
+    -s "$subnet" \
+    ! -d "$subnet" \
+    -m comment --comment "$rule_tag" \
+    -j MASQUERADE; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Use a dedicated chain so protected TCP ports do not depend on multiport support.
+  if ! runTableRule "$silent" table_error \
+    iptables -t nat -N "$dnat_chain"; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Keep container-owned TCP ports handled by the container.
+  for port in ${exclude//,/ }; do
+
+    [ -z "$port" ] && continue
+
+    if ! runTableRule "$silent" table_error \
+      iptables -t nat -A "$dnat_chain" \
+      -p tcp \
+      --dport "$port" \
+      -m comment --comment "$rule_tag" \
+      -j RETURN; then
+      tableError "$silent" "$table_error"
+      return 1
+    fi
+
+  done
+
+  # Forward every remaining protocol and port to the VM.
+  if ! runTableRule "$silent" table_error \
+    iptables -t nat -A "$dnat_chain" \
+    -m comment --comment "$rule_tag" \
+    -j DNAT --to "$ip"; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Process incoming traffic addressed to the container through the VM chain.
+  if ! runTableRule "$silent" table_error \
+    iptables -t nat -A PREROUTING \
+    ! -i "$BRIDGE" \
+    -m addrtype --dst-type LOCAL \
+    -m comment --comment "$rule_tag" \
+    -j "$dnat_chain"; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Process locally generated traffic addressed to the container uplink.
+  if ! runTableRule "$silent" table_error \
+    iptables -t nat -A OUTPUT \
+    -d "$UPLINK" \
+    -m addrtype --dst-type LOCAL \
+    -m comment --comment "$rule_tag" \
+    -j "$dnat_chain"; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Hack for guest VMs complaining about "bad udp checksums in 5 packets".
+  runTableRule "Y" table_error \
+    iptables -t mangle -A POSTROUTING \
+    -s "$subnet" \
+    -p udp \
+    --dport bootpc \
+    -m comment --comment "$rule_tag" \
+    -j CHECKSUM --checksum-fill || true
+
+  # Clamp TCP MSS to avoid subtle MTU blackholes when the outer path has a smaller MTU.
+  runTableRule "Y" table_error \
+    iptables -t mangle -A FORWARD \
+    -s "$subnet" \
+    -p tcp \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "$rule_tag" \
+    -j TCPMSS --clamp-mss-to-pmtu || true
+
+  runTableRule "Y" table_error \
+    iptables -t mangle -A FORWARD \
+    -d "$ip" \
+    -p tcp \
+    --tcp-flags SYN,RST SYN \
+    -m comment --comment "$rule_tag" \
+    -j TCPMSS --clamp-mss-to-pmtu || true
+
+  # Allow forwarding from the VM bridge to external interfaces.
+  if ! runTableRule "$silent" table_error \
+    iptables -A FORWARD \
+    -i "$BRIDGE" \
+    ! -o "$BRIDGE" \
+    -s "$subnet" \
+    -m comment --comment "$rule_tag" \
+    -j ACCEPT; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  # Allow forwarding from external interfaces to the VM.
+  if ! runTableRule "$silent" table_error \
+    iptables -A FORWARD \
+    ! -i "$BRIDGE" \
+    -o "$BRIDGE" \
+    -d "$ip" \
+    -m comment --comment "$rule_tag" \
+    -j ACCEPT; then
+    tableError "$silent" "$table_error"
+    return 1
+  fi
+
+  return 0
+}
+
+clearTables() {
+
+  local line
+  local rules remaining message
+  local dnat_chain="QEMU_DNAT"
+  local rule_tag="$dnat_chain"
+  local own_rule="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
+  local remaining_rule="^:${dnat_chain}[[:space:]]|$own_rule"
+
+  # Return 2 when the currently selected backend cannot be accessed.
+  # This lets configureTables() distinguish it from an actual cleanup failure.
+  if ! rules=$(iptables-save 2> /dev/null); then
+
+    if enabled "$DEBUG"; then
+      message=$(iptables-save 2>&1 > /dev/null || true)
+      showTableCleanupError "iptables-save" "$message"
+    fi
+
+    return 2
+  fi
+
+  if [ -n "$rules" ]; then
+
+    # Delete tagged rules outside the dedicated DNAT chain,
+    # leaving all other rules intact.
+    while IFS= read -r line; do
+
+      case "$line" in
+        \*nat ) local table="nat" ;;
+        \*filter ) local table="filter" ;;
+        \*mangle ) local table="mangle" ;;
+        \*raw ) local table="raw" ;;
+      esac
+
+      if [[ "$line" == -A* ]] && [[ "$line" =~ $own_rule ]]; then
+
+        local chain="${line#-A }"
+        chain="${chain%% *}"
+
+        # Rules inside this chain are removed together by the flush below.
+        if [[ "$table" == "nat" && "$chain" == "$dnat_chain" ]]; then
+          continue
+        fi
+
+        line="${line/-A /-D }"
+
+        # Parse the quoting produced by iptables-save before deleting the rule.
+        if ! message=$(
+          printf '%s\n' "$line" |
+            xargs -r iptables -t "$table" 2>&1
+        ); then
+          showTableCleanupError "iptables -t $table $line" "$message"
+        fi
+
+      fi
+
+    done <<< "$rules"
+
+  fi
+
+  # Remove the dedicated DNAT chain after deleting its references.
+  if iptables -t nat -S "$dnat_chain" > /dev/null 2>&1; then
+
+    if ! message=$(iptables -t nat -F "$dnat_chain" 2>&1); then
+      showTableCleanupError "iptables -t nat -F $dnat_chain" "$message"
+    fi
+
+    if ! message=$(iptables -t nat -X "$dnat_chain" 2>&1); then
+      showTableCleanupError "iptables -t nat -X $dnat_chain" "$message"
+    fi
+
+  fi
+
+  # Base the result on the final ruleset instead of intermediate errors.
+  if ! rules=$(iptables-save 2> /dev/null); then
+
+    if enabled "$DEBUG"; then
+      message=$(iptables-save 2>&1 > /dev/null || true)
+      showTableCleanupError "iptables-save" "$message"
+    fi
+
+    return 1
+  fi
+
+  remaining=$(grep -E -- "$remaining_rule" <<< "$rules" || true)
+
+  if [ -n "$remaining" ]; then
+
+    if enabled "$DEBUG"; then
+      warn "IP tables cleanup left the following rules or chains behind:"
+      echo "$remaining" >&2
+    fi
+
+    return 1
+  fi
+
+  return 0
+}
+
+hasTaggedRules() {
+
+  local save="$1"
+  local rules
+  local dnat_chain="QEMU_DNAT"
+  local rule_tag="$dnat_chain"
+  local own_rule="--comment[[:space:]]+\"?$rule_tag\"?([[:space:]]|\$)"
+  local tagged_rule="^:${dnat_chain}[[:space:]]|$own_rule"
+
+  # Return 2 when the backend cannot be inspected.
+  if ! rules=$("$save" 2>/dev/null); then
+    return 2
+  fi
+
+  if grep -Eq -- "$tagged_rule" <<< "$rules"; then
+    return 0
+  fi
+
+  return 1
+}
+
+configureTables() {
+
+  local ip="$1"
+  local subnet="$2"
+  local preferred
+  local alternate_save
+  local preferred_clean="N"
+  local alternate_dirty="N"
+
+  preferred=$(getTablesBackend) || {
+    enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+    warn "failed to determine the active IP tables backend!"
+    return 1
+  }
+
+  case "$preferred" in
+    "nft" ) local alternate="legacy" ;;
+    "legacy" ) local alternate="nft" ;;
+    * )
+      enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+      warn "unsupported IP tables backend: $preferred"
+      return 1 ;;
+  esac
+
+  # Inspect the alternate backend without changing the active alternative.
+  alternate_save=$(command -v "iptables-$alternate-save" 2>/dev/null || true)
+
+  if [ -n "$alternate_save" ]; then
+
+    if hasTaggedRules "$alternate_save"; then
+
+      # Only switch backends when stale QEMU rules were positively found.
+      if ! setTables "$alternate"; then
+        enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+        warn "failed to select the $alternate IP tables backend for cleanup!"
+        return 1
+      fi
+
+      if ! clearTables; then
+        alternate_dirty="Y"
+      fi
+
+      # Always restore the originally selected backend after cleanup.
+      if ! setTables "$preferred"; then
+        enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+        warn "failed to restore the preferred $preferred IP tables backend!"
+        return 1
+      fi
+
+      if enabled "$alternate_dirty"; then
+        enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+        warn "failed to clean up the existing $alternate IP tables configuration!"
+        return 1
+      fi
+
+    else
+
+      local rc=$?
+
+      # An unavailable alternate backend does not affect normal startup.
+      if (( rc == 2 )) && enabled "$DEBUG"; then
+        warn "failed to inspect the $alternate IP tables backend!"
+      fi
+
+    fi
+
+  fi
+
+  # Try the preferred backend first.
+  if clearTables; then
+
+    preferred_clean="Y"
+
+    # Try the preferred backend without reporting provisional failures.
+    if applyTables "$ip" "$subnet" "Y"; then
+      checkExistingTables
+      return 0
+    fi
+
+    # Never switch backends while partial rules remain in the preferred backend.
+    if ! clearTables; then
+      enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+      warn "failed to clean up the partial $preferred IP tables configuration!"
+      return 1
+    fi
+
+  else
+
+    local rc=$?
+
+    # The preferred backend was accessible, but its rules could not be removed.
+    # Do not switch while partial or stale rules may still be active.
+    if (( rc == 1 )); then
+      enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+      warn "failed to clean up the existing $preferred IP tables configuration!"
+      return 1
+    fi
+
+    # Return code 2 means the preferred backend itself could not be accessed,
+    # so it is safe to try the alternate backend.
+    if (( rc != 2 )); then
+      enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+      warn "failed to access the $preferred IP tables backend!"
+      return 1
+    fi
+
+    if enabled "$DEBUG"; then
+      warn "failed to access the $preferred IP tables backend!"
+    fi
+
+  fi
+
+  # Try the alternate backend when the preferred backend failed.
+  if setTables "$alternate"; then
+
+    # Remove rules left by a previous run from the alternate backend.
+    if clearTables; then
+
+      if applyTables "$ip" "$subnet" "Y"; then
+        checkExistingTables
+        return 0
+      fi
+
+      if ! clearTables; then
+
+        alternate_dirty="Y"
+
+        if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+          warn "failed to clean up the partial $alternate IP tables configuration!"
+        fi
+
+      fi
+
+    else
+
+      local rc=$?
+
+      # Only mark the alternate backend dirty when it was accessible but cleanup failed.
+      if (( rc == 1 )); then
+
+        alternate_dirty="Y"
+
+        if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+          warn "failed to clean up the existing $alternate IP tables configuration!"
+        fi
+
+      elif (( rc != 2 )); then
+
+        alternate_dirty="Y"
+
+        if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+          warn "failed to inspect the existing $alternate IP tables configuration!"
+        fi
+
+      elif enabled "$DEBUG"; then
+        warn "failed to access the $alternate IP tables backend!"
+      fi
+
+    fi
+  fi
+
+  # Restore the preferred backend after the alternate attempt failed.
+  if ! setTables "$preferred"; then
+    enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
+    warn "failed to restore the preferred $preferred IP tables backend!"
+    return 1
+  fi
+
+  # Do not continue while partial rules remain in the alternate backend.
+  enabled "$alternate_dirty" && return 1
+
+  # Both backend failures were already shown in debug mode.
+  enabled "$DEBUG" && return 1
+
+  # Rootless NAT failures should remain silent before falling back.
+  enabled "$ROOTLESS" && return 1
+
+  # An inaccessible preferred backend cannot be retried diagnostically.
+  if ! enabled "$preferred_clean"; then
+    warn "failed to access both IP tables backends!"
+    return 1
+  fi
+
+  # Verify that no rules remain before the diagnostic attempt.
+  if ! clearTables; then
+    warn "failed to clean up the existing $preferred IP tables configuration!"
+    return 1
+  fi
+
+  # Repeat the preferred backend once to show its actual failure.
+  if applyTables "$ip" "$subnet" "N"; then
+    checkExistingTables
+    return 0
+  fi
+
+  # Do not leave a partial ruleset after the final failed attempt.
+  if ! clearTables; then
+    warn "failed to clean up the partial $preferred IP tables configuration!"
+  fi
+
+  return 1
+}
+
+addUpstream() {
+
+  local upstream="$1"
+  local table_error
+  local rule_tag="QEMU_DNAT"
+
+  [ -n "$upstream" ] || return 1
+  [ -n "$GATEWAY" ] || return 1
+
+  # system.lan is a synthetic /32 on the VM bridge and is DNATed to the real
+  # container gateway, avoiding a route through the guest itself.
+  if ! ip address add "$upstream/32" dev "$BRIDGE"; then
+    if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+      warn "failed to add the system.lan address; access through that name will be unavailable."
+    fi
+    return 1
+  fi
+
+  if ! runTableRule "Y" table_error \
+    iptables -t nat -A PREROUTING \
+    -i "$BRIDGE" \
+    -d "$upstream" \
+    -m comment --comment "$rule_tag" \
+    -j DNAT --to-destination "$GATEWAY"; then
+
+    ip address del "$upstream/32" dev "$BRIDGE" > /dev/null 2>&1 || :
+
+    if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+      [ -n "$table_error" ] && echo "$table_error" >&2
+      warn "failed to configure system.lan forwarding; access through that name will be unavailable."
+    fi
+
+    return 1
+  fi
+
   return 0
 }
 
 configureNAT() {
 
   local tuntap="TUN device is missing. $ADD_ERR --device /dev/net/tun"
-  local tables="the 'ip_tables' kernel module is not loaded. Try this command: sudo modprobe ip_tables iptable_nat"
+  local ip subnet upstream="" forwarding=""
 
-  [[ "$DEBUG" == [Yy1]* ]] && echo "Configuring NAT networking..."
+  enabled "$DEBUG" && echo "Configuring NAT networking..."
 
   # Create the necessary file structure for /dev/net/tun
   if [ ! -c /dev/net/tun ]; then
-    [ ! -d /dev/net ] && mkdir -m 755 /dev/net
-    if mknod /dev/net/tun c 10 200; then
+    [ ! -d /dev/net ] && mkdir -m 755 /dev/net > /dev/null 2>&1 || :
+
+    local msg
+    { msg=$(mknod /dev/net/tun c 10 200 2>&1); local rc=$?; } || :
+
+    if (( rc == 0 )); then
       chmod 666 /dev/net/tun
+    elif ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+      [ -n "$msg" ] && echo "$msg" >&2
     fi
   fi
 
   if [ ! -c /dev/net/tun ]; then
-    [[ "$ROOTLESS" == [Yy1]* && "$DEBUG" != [Yy1]* ]] && return 1
+    enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
     warn "$tuntap" && return 1
   fi
 
   # Check port forwarding flag
-  if [[ $(< /proc/sys/net/ipv4/ip_forward) -eq 0 ]]; then
-    { sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1; rc=$?; } || :
-    if (( rc != 0 )) || [[ $(< /proc/sys/net/ipv4/ip_forward) -eq 0 ]]; then
-      [[ "$ROOTLESS" == [Yy1]* && "$DEBUG" != [Yy1]* ]] && return 1
+  [ -r /proc/sys/net/ipv4/ip_forward ] &&
+    forwarding=$(< /proc/sys/net/ipv4/ip_forward)
+
+  if [[ "$forwarding" != "1" ]]; then
+    { sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1; local rc=$?; } || :
+
+    forwarding=""
+    [ -r /proc/sys/net/ipv4/ip_forward ] &&
+      forwarding=$(< /proc/sys/net/ipv4/ip_forward)
+
+    if (( rc != 0 )) || [[ "$forwarding" != "1" ]]; then
+      enabled "$ROOTLESS" && ! enabled "$DEBUG" && return 1
       warn "IP forwarding is disabled. $ADD_ERR --sysctl net.ipv4.ip_forward=1"
       return 1
     fi
   fi
 
-  local ip base
-  base=$(echo "$IP" | sed -r 's/([^.]*.){2}//')
-  if [[ "$IP" != "172.30."* ]]; then
-    ip="172.30.$base"
+  if [ -n "$IP" ]; then
+    ip=$(guestIP "$IP" 2)
   else
-    ip="172.31.$base"
+    ip=$(natGuestIP "$UPLINK") || return 1
   fi
 
-  [ -n "$VM_NET_IP" ] && ip="$VM_NET_IP"
+  local gateway="${ip%.*}.1"
+  subnet=$(networkCIDR "$ip") || return 1
 
-  local gateway=""
-  if [[ "$ip" != *".1" ]]; then
-    gateway="${ip%.*}.1"
+  if [ -n "$GATEWAY" ]; then
+    upstream=$(upstreamIP "$subnet" "$ip" "$gateway") || upstream=""
+  fi
+
+  if subnetInUse "$subnet"; then
+    error "VM subnet $subnet conflicts with an existing route inside the container."
+    return 1
   else
-    gateway="${ip%.*}.2"
+    local rc=$?
+    (( rc == 1 )) || return 1
   fi
 
-  # Create a bridge with a static IP for the VM guest
-  { ip link add dev "$VM_NET_BRIDGE" type bridge ; rc=$?; } || :
+  createBridge "$gateway" || return 1
+  createTap "$tuntap" || return 1
 
-  if (( rc != 0 )); then
-    [[ "$ROOTLESS" == [Yy1]* && "$DEBUG" != [Yy1]* ]] && return 1
-    warn "failed to create bridge. $ADD_ERR --cap-add NET_ADMIN" && return 1
+  # Use the lowest effective guest-facing MTU, without mutating the parent/uplink MTU.
+  if [[ "$GUEST_MTU" != "0" ]]; then
+    GUEST_MTU=$(minMTU "$GUEST_MTU" "$(getMTU "$BRIDGE")" "$(getMTU "$TAP")")
   fi
 
-  if ! ip address add "$gateway/24" broadcast "${ip%.*}.255" dev "$VM_NET_BRIDGE"; then
-    warn "failed to add IP address pool!" && return 1
+  configureTables "$ip" "$subnet" || return 1
+
+  if [ -n "$upstream" ] && ! addUpstream "$upstream"; then
+    upstream=""
   fi
 
-  # Backwards compatibility
-  compat "$gateway" "$VM_NET_BRIDGE" || :
-
-  while ! ip link set "$VM_NET_BRIDGE" up; do
-    info "Waiting for IP address to become available..."
-    sleep 2
-  done
-
-  # QEMU Works with taps, set tap to the bridge created
-  if ! ip tuntap add dev "$VM_NET_TAP" mode tap; then
-    [[ "$ROOTLESS" == [Yy1]* && "$DEBUG" != [Yy1]* ]] && return 1
-    warn "$tuntap" && return 1
-  fi
-
-  if [[ "$MTU" != "0" && "$MTU" != "1500" ]]; then
-    if ! ip link set dev "$VM_NET_TAP" mtu "$MTU"; then
-      warn "failed to set MTU size to $MTU."
-    fi
-  fi
-
-  if ! ip link set dev "$VM_NET_TAP" address "$GATEWAY_MAC"; then
-    warn "failed to set gateway MAC address.."
-  fi
-
-  while ! ip link set "$VM_NET_TAP" up promisc on; do
-    info "Waiting for TAP to become available..."
-    sleep 2
-  done
-
-  if ! ip link set dev "$VM_NET_TAP" master "$VM_NET_BRIDGE"; then
-    warn "failed to set master bridge!" && return 1
-  fi
-
-  if grep -wq "nf_tables" /proc/modules; then
-    update-alternatives --set iptables /usr/sbin/iptables-nft > /dev/null
-    update-alternatives --set ip6tables /usr/sbin/ip6tables-nft > /dev/null
-  else
-    update-alternatives --set iptables /usr/sbin/iptables-legacy > /dev/null
-    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy > /dev/null
-  fi
-
-  exclude=$(getHostPorts)
-
-  if [ -n "$exclude" ]; then
-    if [[ "$exclude" != *","* ]]; then
-      exclude=" ! --dport $exclude"
-    else
-      exclude=" -m multiport ! --dports $exclude"
-    fi
-  fi
-
-  if ! iptables -t nat -A POSTROUTING -o "$VM_NET_DEV" -j MASQUERADE > /dev/null 2>&1; then
-    [[ "$ROOTLESS" == [Yy1]* && "$DEBUG" != [Yy1]* ]] && return 1
-    if ! iptables -t nat -A POSTROUTING -o "$VM_NET_DEV" -j MASQUERADE; then
-      warn "$tables" && return 1
-    fi
-  fi
-
-  # shellcheck disable=SC2086
-  if ! iptables -t nat -A PREROUTING -i "$VM_NET_DEV" -d "$IP" -p tcp${exclude} -j DNAT --to "$ip"; then
-    warn "failed to configure IP tables!" && return 1
-  fi
-
-  if ! iptables -t nat -A PREROUTING -i "$VM_NET_DEV" -d "$IP" -p udp -j DNAT --to "$ip"; then
-    warn "failed to configure IP tables!" && return 1
-  fi
-
-  if (( KERNEL > 4 )); then
-    # Hack for guest VMs complaining about "bad udp checksums in 5 packets"
-    iptables -A POSTROUTING -t mangle -p udp --dport bootpc -j CHECKSUM --checksum-fill > /dev/null 2>&1 || true
-  fi
-
-  NET_OPTS="-netdev tap,id=hostnet0,ifname=$VM_NET_TAP"
+  NET_OPTS="-netdev tap,id=hostnet0,ifname=$TAP"
 
   if [ -c /dev/vhost-net ]; then
-    { exec 40>>/dev/vhost-net; rc=$?; } 2>/dev/null || :
+    { exec 40>>/dev/vhost-net; local rc=$?; } 2>/dev/null || :
     (( rc == 0 )) && NET_OPTS+=",vhost=on,vhostfd=40"
   fi
 
   NET_OPTS+=",script=no,downscript=no"
 
-  configureDNS "$VM_NET_BRIDGE" "$ip" "$VM_NET_MAC" "$VM_NET_HOST" "$VM_NET_MASK" "$gateway" || return 1
+  configureDNS "$BRIDGE" "$ip" "$MAC" "$HOST" "$MASK" "$gateway" "$upstream" || return 1
 
-  VM_NET_IP="$ip"
+  IP="$ip"
   return 0
 }
 
-closeBridge() {
+# ######################################
+#  Cleanup
+# ######################################
 
-  [ -s "$PASST_PID" ] && pKill "$(<"$PASST_PID")"
-  rm -f "$PASST_PID"
+closeInterfaces() {
 
-  [ -s "$DNSMASQ_PID" ] && pKill "$(<"$DNSMASQ_PID")"
-  rm -f "$DNSMASQ_PID"
+  local pids=( "$PASST_PID" "$DNSMASQ_PID" )
+  mKill "${pids[@]}"
 
-  case "${NETWORK,,}" in
-    "user"* | "passt" | "slirp" ) return 0 ;;
-  esac
+  exec 30<&- || :
+  exec 40<&- || :
 
-  ip link set "$VM_NET_TAP" down promisc off &> null || true
-  ip link delete "$VM_NET_TAP" &> null || true
+  ip link set "$TAP" down promisc off &> /dev/null || :
+  ip link delete "$TAP" &> /dev/null || :
 
-  ip link set "$VM_NET_BRIDGE" down &> null || true
-  ip link delete "$VM_NET_BRIDGE" &> null || true
+  ip link set "$BRIDGE" down &> /dev/null || :
+  ip link delete "$BRIDGE" &> /dev/null || :
 
-  return 0
-}
-
-closeWeb() {
-
-  # Shutdown nginx
-  nginx -s stop 2> /dev/null
-  fWait "nginx"
-
-  # Shutdown websocket
-  local pid="/var/run/websocketd.pid"
-  [ -s "$pid" ] && pKill "$(<"$pid")"
-  rm -f "$pid"
-
+  clearTables || :
   return 0
 }
 
 closeNetwork() {
 
-  if [[ "${WEB:-}" != [Nn]* ]]; then
-    closeWeb
+  if ! disabled "${WEB:-}"; then
+    stopAllServers
   fi
 
-  [[ "$NETWORK" == [Nn]* ]] && return 0
+  disabled "$NETWORK" && return 0
 
-  exec 30<&- || true
-  exec 40<&- || true
-
-  if [[ "$DHCP" != [Yy1]* ]]; then
-
-    closeBridge
-    return 0
-
-  fi
-
-  ip link set "$VM_NET_TAP" down || true
-  ip link delete "$VM_NET_TAP" || true
+  # Tear down artifacts from an earlier initialization before selecting and
+  # configuring the current network mode.
+  closeInterfaces
 
   return 0
 }
 
-cleanUp() {
+# ######################################
+#  Detection
+# ######################################
 
-  # Clean up old files
-  rm -f "$PASST_PID"
-  rm -f "$DNSMASQ_PID"
-  rm -f /etc/resolv.dnsmasq
+compat() {
 
-  if [[ -d "/sys/class/net/$VM_NET_TAP" ]]; then
-    info "Lingering interface will be removed..."
-    ip link delete "$VM_NET_TAP" || true
+  local gateway="$1"
+  local interface="$2"
+  local samba="20.20.20.1"
+  local label="compat"
+  local err="failed to configure IP alias for backwards compatibility."
+
+  [[ "$samba" == "$gateway" ]] && return 0
+  [[ "${APP,,}" != "windows" ]] && return 0
+
+  if (( ${#interface} > 8 )); then
+    label="c"
+    if (( ${#interface} > 13 )); then
+      warn "$err Interface name \"$interface\" is too long for an alias label!"
+      return 0
+    fi
+  fi
+
+  # Preserve the legacy 20.20.20.1 host.lan address used by older guest hosts-file entries.
+  local msg
+  { msg=$(ip address add dev "$interface" "$samba/24" label "$interface:$label" 2>&1); local rc=$?; } || :
+
+  if (( rc == 0 )); then
+    SAMBA_INTERFACE="$samba"
+    return 0
+  fi
+
+  case "${msg,,}" in
+    *"address already assigned"* | *"file exists"* )
+      SAMBA_INTERFACE="$samba"
+      return 0 ;;
+  esac
+
+  if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+    [ -n "$msg" ] && echo "$msg" >&2
+
+    case "${msg,,}" in
+      *"operation not permitted"* | *"permission denied"* )
+        warn "$err Please add the NET_ADMIN capability." ;;
+      * )
+        warn "$err" ;;
+    esac
   fi
 
   return 0
@@ -668,150 +1965,339 @@ cleanUp() {
 
 checkOS() {
 
-  local kernel
-  local os=""
-  local if="macvlan"
+  local iface="macvlan"
+  local os="" kernel
+
   kernel=$(uname -a)
 
   [[ "${kernel,,}" == *"darwin"* ]] && os="$ENGINE Desktop for macOS"
   [[ "${kernel,,}" == *"microsoft"* ]] && os="$ENGINE Desktop for Windows"
 
-  if [[ "$DHCP" == [Yy1]* ]]; then
-    if="macvtap"
+  if enabled "$DHCP"; then
+    iface="macvtap"
     [[ "${kernel,,}" == *"synology"* ]] && os="Synology Container Manager"
   fi
 
   if [ -n "$os" ]; then
-    warn "you are using $os which does not support $if, please revert to bridge networking!"
+    warn "you are using $os which does not support $iface, please revert to bridge networking!"
   fi
 
   return 0
 }
 
-getInfo() {
+validateInterface() {
 
-  if [ -z "$VM_NET_DEV" ]; then
-    # Give Kubernetes priority over the default interface
-    [ -d "/sys/class/net/net0" ] && VM_NET_DEV="net0"
-    [ -d "/sys/class/net/net1" ] && VM_NET_DEV="net1"
-    [ -d "/sys/class/net/net2" ] && VM_NET_DEV="net2"
-    [ -d "/sys/class/net/net3" ] && VM_NET_DEV="net3"
-    # Automatically detect the default network interface
-    [ -z "$VM_NET_DEV" ] && VM_NET_DEV=$(awk '$2 == 00000000 { print $1 }' /proc/net/route)
-    [ -z "$VM_NET_DEV" ] && VM_NET_DEV="eth0"
+  if [ ! -d "/sys/class/net/$DEV" ]; then
+    error "Network interface '$DEV' does not exist inside the container!"
+    error "$ADD_ERR -e \"DEV=NAME\" to specify another interface name."
+    exit 26
   fi
 
-  if [ ! -d "/sys/class/net/$VM_NET_DEV" ]; then
-    error "Network interface '$VM_NET_DEV' does not exist inside the container!"
-    error "$ADD_ERR -e \"VM_NET_DEV=NAME\" to specify another interface name." && exit 26
+  return 0
+}
+
+validateMask() {
+
+  PREFIX=$(maskToCIDR "$MASK") || exit 28
+
+  if ! enabled "$DHCP" && (( PREFIX < 16 || PREFIX > 24 )); then
+    error "Unsupported MASK: '$MASK' (supported range: /16 through /24)"
+    exit 28
   fi
 
-  GATEWAY=$(ip route list dev "$VM_NET_DEV" | awk ' /^default/ {print $3}' | head -n 1)
-  { IP=$(ip address show dev "$VM_NET_DEV" | grep inet | awk '/inet / { print $2 }' | cut -f1 -d/ | head -n 1); rc=$?; } 2>/dev/null || :
+  return 0
+}
 
-  if (( rc != 0 )) && [[ "$DHCP" != [Yy1]* ]]; then
-    error "Could not determine container IP address!" && exit 26
+validateHost() {
+
+  HOST="${HOST//[^A-Za-z0-9-]/-}"
+  HOST=$(echo "$HOST" | sed 's/^-*//;s/-*$//;s/--*/-/g')
+
+  if [ -z "$HOST" ]; then
+    HOST="$APP"
+    HOST="${HOST//[^A-Za-z0-9-]/-}"
+    HOST=$(echo "$HOST" | sed 's/^-*//;s/-*$//;s/--*/-/g')
   fi
 
-  IP6=""
-  # shellcheck disable=SC2143
-  if [ -f /proc/net/if_inet6 ] && [ -n "$(ifconfig -a | grep inet6)" ]; then
-    { IP6=$(ip -6 addr show dev "$VM_NET_DEV" scope global up); rc=$?; } 2>/dev/null || :
-    (( rc != 0 )) && IP6=""
-    [ -n "$IP6" ] && IP6=$(echo "$IP6" | sed -e's/^.*inet6 \([^ ]*\)\/.*$/\1/;t;d' | head -n 1)
+  return 0
+}
+
+validateHostPorts() {
+
+  local custom
+  custom=$(getCustomHostPorts "all")
+
+  if isNAT && [[ "$custom" == *"/udp"* ]]; then
+    warn "UDP ports in \"HOST_PORTS\" are not yet implemented for NAT networking."
   fi
 
-  local result nic bus
-  result=$(ethtool -i "$VM_NET_DEV")
-  nic=$(grep -m 1 -i 'driver:' <<< "$result" | awk '{print $(2)}')
-  bus=$(grep -m 1 -i 'bus-info:' <<< "$result" | awk '{print $(2)}')
+  return 0
+}
 
-  if [[ "${bus,,}" != "" && "${bus,,}" != "n/a" && "${bus,,}" != "tap" ]]; then
-    [[ "$DEBUG" == [Yy1]* ]] && info "Detected BUS: $bus"
+validateAddresses() {
+
+  # DHCP/macvtap mode can work without a detectable container IPv4 address,
+  # because the guest receives its address directly from the external LAN.
+  if [ -z "$UPLINK" ] && ! enabled "$DHCP"; then
+    error "Could not determine container IPv4 address!"
+    exit 26
+  fi
+
+  return 0
+}
+
+validateAdapter() {
+
+  if [[ -n "$BUS" && "${BUS,,}" != "n/a" && "${BUS,,}" != "tap" ]]; then
+    enabled "$DEBUG" && info "Detected NIC: ${NIC:-unknown}  BUS: $BUS"
     error "This container does not support host mode networking!"
     exit 29
   fi
 
-  if [[ "$DHCP" == [Yy1]* ]]; then
+  if enabled "$DHCP"; then
 
     checkOS
 
-    if [[ "${nic,,}" == "ipvlan" ]]; then
+    if [[ "${NIC,,}" == "ipvlan" ]]; then
       error "This container does not support IPVLAN networking when DHCP=Y."
       exit 29
     fi
 
-    if [[ "${nic,,}" != "macvlan" ]]; then
-      [[ "$DEBUG" == [Yy1]* ]] && info "Detected NIC: $nic"
+    if [[ "${NIC,,}" != "macvlan" ]]; then
+      enabled "$DEBUG" && info "Detected NIC: ${NIC:-unknown}"
       error "The container needs to be in a MACVLAN network when DHCP=Y."
       exit 29
     fi
 
+    if uname -a | grep -Eqi 'unraid|truenas'; then
+
+      # Check if host exposes the bridge-nf sysctl
+      # (only visible if br_netfilter is loaded and /proc/sys is accessible)
+
+      local bnf="/proc/sys/net/bridge/bridge-nf-call-iptables"
+
+      if [[ -r "$bnf" ]] && [[ "$(<"$bnf")" != "0" ]]; then
+        warn "external LAN clients may not be able to reach this container, because net.bridge.bridge-nf-call-iptables=1."
+        warn "you can fix this issue by running 'sysctl -w net.bridge.bridge-nf-call-iptables=0' on the host system."
+      fi
+
+    fi
+
   else
 
-    if [[ "$IP" != "172."* && "$IP" != "10.8"* && "$IP" != "10.9"* ]]; then
+    if [[ "$UPLINK" != "172."* && "$UPLINK" != "10.8"* && "$UPLINK" != "10.9"* ]]; then
       checkOS
     fi
 
   fi
 
-  local mtu=""
+  return 0
+}
 
-  if [ -f "/sys/class/net/$VM_NET_DEV/mtu" ]; then
-    mtu=$(< "/sys/class/net/$VM_NET_DEV/mtu")
+configureMTU() {
+
+  local mtu=""
+  local mtu_custom="N"
+
+  if [ -f "/sys/class/net/$DEV/mtu" ]; then
+    mtu=$(< "/sys/class/net/$DEV/mtu")
   fi
 
+  [ -n "$MTU" ] && mtu_custom="Y"
   [ -z "$MTU" ] && MTU="$mtu"
   [ -z "$MTU" ] && MTU="0"
 
-  if [[ "${ADAPTER,,}" != "virtio-net-pci" ]]; then
-    if [[ "$MTU" != "0" ]] && [ "$MTU" -lt "1500" ]; then
-      warn "MTU size is $MTU, but cannot be set for $ADAPTER adapters!" && MTU="0"
-    fi
+  GUEST_MTU="$MTU"
+
+  # Automatically propagate smaller-than-standard MTUs, but do not automatically
+  # advertise jumbo frames unless the user explicitly requested MTU.
+  if [[ "$GUEST_MTU" != "0" && "$GUEST_MTU" -gt "1500" ]] && ! enabled "$mtu_custom"; then
+    GUEST_MTU="1500"
   fi
 
-  if [[ "${BOOT_MODE:-}" == "windows_legacy" ]]; then
-    if [[ "$MTU" != "0" ]] && [ "$MTU" -lt "1500" ]; then
-      warn "MTU size is $MTU, but cannot be set for legacy Windows versions!" && MTU="0"
-    fi
-  fi
+  return 0
+}
+
+configureMAC() {
+
+  local container
+  container=$(containerID)
 
   if [ -z "$MAC" ]; then
-    local file="$STORAGE/$PROCESS.mac"
-    [ -s "$file" ] && MAC=$(<"$file")
-    MAC="${MAC//[![:print:]]/}"
+
+    if ! restoreState MAC "mac"; then
+      error "Failed to read MAC address from \"$STORAGE/$PROCESS.mac\" !"
+      exit 28
+    fi
+
     if [ -z "$MAC" ]; then
-      # Generate MAC address based on Docker container ID in hostname
-      MAC=$(echo "$HOST" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
-      echo "${MAC^^}" > "$file"
-      ! setOwner "$file" && error "Failed to set the owner for \"$file\" !"
+
+      # Generate a MAC address based on a stable container identifier when possible.
+      MAC=$(echo "$container" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
+
+      if ! writeState "mac" "${MAC^^}"; then
+        error "Failed to write MAC address to \"$STORAGE/$PROCESS.mac\" !"
+        exit 28
+      fi
+
     fi
   fi
 
-  VM_NET_MAC="${MAC^^}"
-  VM_NET_MAC="${VM_NET_MAC//-/:}"
+  MAC="${MAC^^}"
+  MAC="${MAC//-/:}"
 
-  if [[ ${#VM_NET_MAC} == 12 ]]; then
-    m="$VM_NET_MAC"
-    VM_NET_MAC="${m:0:2}:${m:2:2}:${m:4:2}:${m:6:2}:${m:8:2}:${m:10:2}"
+  if [[ ${#MAC} == 12 ]]; then
+    local m="$MAC"
+    MAC="${m:0:2}:${m:2:2}:${m:4:2}:${m:6:2}:${m:8:2}:${m:10:2}"
   fi
 
-  if [[ ${#VM_NET_MAC} != 17 ]]; then
-    error "Invalid MAC address: '$VM_NET_MAC', should be 12 or 17 digits long!" && exit 28
+  if [[ ${#MAC} != 17 ]]; then
+    error "Invalid MAC address: '$MAC', should be 12 or 17 digits long!"
+    exit 28
   fi
 
-  GATEWAY_MAC=$(echo "$VM_NET_MAC" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
+  # Keep the guest-facing gateway MAC stable across runs, otherwise Windows guests
+  # may detect a new network every boot.
+  GATEWAY_MAC=$(gatewayMAC "$MAC")
 
-  if [[ "$DEBUG" == [Yy1]* ]]; then
-    line="Host: $HOST  IP: $IP  Gateway: $GATEWAY  Interface: $VM_NET_DEV  MAC: $VM_NET_MAC  MTU: $mtu"
-    [[ "$MTU" != "0" && "$MTU" != "$mtu" ]] && line+=" ($MTU)"
-    info "$line"
-    if [ -f /etc/resolv.conf ]; then
-      nameservers=$(grep '^nameserver*' /etc/resolv.conf | head -c -1 | sed 's/nameserver //g;' | sed -z 's/\n/, /g')
-      [ -n "$nameservers" ] && info "Nameservers: $nameservers"
-    fi
-    echo
+  return 0
+}
+
+showHostInfo() {
+
+  local mtu host uplink prefix
+
+  prefix=$(ip -4 -o address show dev "$DEV" scope global 2>/dev/null |
+    awk -v ip="$UPLINK" '
+      {
+        split($4, address, "/")
+        if (address[1] == ip) {
+          print address[2]
+          exit
+        }
+      }
+    ')
+
+  uplink=$(formatAddress "$UPLINK" "$prefix" || true)
+  [ -z "$uplink" ] && uplink="(none)"
+
+  local line="❯ Host: $uplink"
+
+  host=$(containerID)
+  [ -n "$host" ] && line+=" ($host)"
+
+  local obvious=""
+  if [[ "$UPLINK" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+    obvious="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.1"
   fi
+
+  local gateway="${GATEWAY:-}"
+  if [ -z "$gateway" ]; then
+    line+="  |  Gateway: (none)"
+  elif [[ "$gateway" != "$obvious" ]]; then
+    line+="  |  Gateway: $gateway"
+  fi
+
+  local iface="$DEV"
+  if [ -n "$NIC" ] && [[ "${NIC,,}" != "veth" ]]; then
+    iface+="/$NIC"
+  fi
+
+  [ -z "$iface" ] && iface="(none)"
+  [[ "$iface" != "eth0" ]] && line+="  |  Interface: $iface"
+
+  mtu=$(getMTU "$DEV")
+  if [ -n "$mtu" ] && [[ "$mtu" != "0" && "$mtu" != "1500" ]]; then
+    line+="  |  MTU: $mtu"
+  fi
+
+  local nameservers=""
+  local file="/etc/resolv.dnsmasq"
+  [ ! -f "$file" ] && file="/etc/resolv.conf"
+
+  if [ -f "$file" ]; then
+    nameservers=$(awk '$1 == "nameserver" { print $2 }' "$file" |
+      paste -sd ',' |
+      sed 's/,/, /g' || true)
+  fi
+
+  [ -z "$nameservers" ] && nameservers="(none)"
+  [[ "$nameservers" == "127.0.0.1"* ]] && nameservers=""
+
+  echo
+
+  if (( ${#nameservers} <= 40 )); then
+    [ -n "$nameservers" ] && line+="  |  DNS: $nameservers"
+    echo "$line"
+  else
+    echo "$line"
+    echo "❯ DNS: $nameservers"
+  fi
+
+  enabled "$DEBUG" && echo
+  return 0
+}
+
+showGuestInfo() {
+
+  local ip="${IP:-}"
+
+  [ -n "$ip" ] && ip=$(formatAddress "$ip" "$PREFIX" || true)
+  [ -z "$ip" ] && ip="DHCP"
+
+  local line="❯ Guest: $ip"
+
+  if [ -n "${HOST:-}" ]; then
+    line+=" ($HOST)"
+  fi
+
+  local mode="${NETWORK,,}"
+
+  if enabled "$DHCP"; then
+    mode="DHCP"
+  elif isNAT; then
+    mode="NAT"
+  elif isUserMode; then
+    mode="User ($mode)"
+  elif [ -z "$mode" ]; then
+    mode="(none)"
+  fi
+
+  line+="  |  Mode: $mode"
+
+  [ -n "$MAC" ] && line+="  |  MAC: $MAC"
+
+  echo "$line"
+  echo
+  return 0
+}
+
+initializeNetwork() {
+
+  detectInterface
+  validateInterface
+
+  validateMask
+  validateHost
+  validateHostPorts
+
+  detectAddresses
+  validateAddresses
+
+  detectAdapter
+  validateAdapter
+
+  configureMTU
+  configureMAC
+  configureBridge
+
+  showHostInfo
+
+  closeInterfaces
+
+  # Clean up old files
+  rm -f "$PASST_PID" "$PASST_SOCKET"
+  rm -f "$DNSMASQ_PID" /etc/resolv.dnsmasq
 
   return 0
 }
@@ -820,82 +2306,115 @@ getInfo() {
 #  Configure Network
 # ######################################
 
-if [[ "$NETWORK" == [Nn]* ]]; then
+if disabled "$NETWORK"; then
   NET_OPTS=""
   return 0
 fi
 
 msg="Initializing network..."
 html "$msg"
-[[ "$DEBUG" == [Yy1]* ]] && echo "$msg"
+enabled "$DEBUG" && echo "$msg"
 
-getInfo
-cleanUp
+initializeNetwork
 
-if [[ "$DHCP" == [Yy1]* ]]; then
+if enabled "$DHCP"; then
 
   # Configure for macvtap interface
-  configureDHCP || exit 20
+  configureVTAP || exit 20
+  showGuestInfo
 
 else
 
-  case "${NETWORK,,}" in
-    "passt" | "slirp" | "user"* ) ;;
-    "tap" | "tun" | "tuntap" | "y" | "" )
+  if isNAT; then
 
-      # Configure tap interface
-      if ! configureNAT; then
+    # Configure tap interface
+    if ! configureNAT; then
 
-        closeBridge
-        NETWORK="user"
+      # NAT setup failure is recoverable: tear down partial interfaces and
+      # continue with the default user-mode backend.
 
-        if [[ "$ROOTLESS" != [Yy1]* || "$DEBUG" == [Yy1]* ]]; then
-          msg="falling back to user-mode networking!"
-          msg="failed to setup NAT networking, $msg"
-          warn "$msg"
-        fi
+      closeInterfaces
+      NETWORK="user"
 
-      fi ;;
+      if ! enabled "$ROOTLESS" || enabled "$DEBUG"; then
+        msg="falling back to user-mode networking!"
+        msg="failed to setup NAT networking, $msg"
+        warn "$msg"
+      fi
 
-  esac
+    fi
 
-  case "${NETWORK,,}" in
-    "tap" | "tun" | "tuntap" | "y" | "" ) ;;
-    "passt" | "user"* )
+  fi
 
-      # Configure for user-mode networking (passt)
-      if ! configurePasst; then
-        error "Failed to configure user-mode networking!"
-        exit 24
-      fi ;;
+  if isUserMode; then
 
-    "slirp" )
+    case "${NETWORK,,}" in
+      "passt" | "user"* )
 
-      # Configure for user-mode networking (slirp)
-      if ! configureSlirp; then
-        error "Failed to configure user-mode networking!"
-        exit 24
-      fi ;;
+        # Configure for user-mode networking (passt)
+        if ! configurePasst; then
+          error "Failed to configure user-mode networking!"
+          exit 24
+        fi ;;
 
-    *)
-      error "Unrecognized NETWORK value: \"$NETWORK\"" && exit 24 ;;
-  esac
+      "slirp" )
 
-  case "${NETWORK,,}" in
-    "passt" | "slirp" )
+        # Configure for user-mode networking (slirp)
+        if ! configureSlirp; then
+          error "Failed to configure user-mode networking!"
+          exit 24
+        fi ;;
 
-      if [ -z "$USER_PORTS" ]; then
-        desc="$APP"
-        [[ "${desc,,}" == "qemu" ]] && desc="the VM"
-        info "Notice: because user-mode networking is active, when you need to forward custom ports to $desc, add them to the \"USER_PORTS\" variable."
-      fi ;;
+    esac
 
-  esac
+  elif ! isNAT; then
+
+    error "Unrecognized NETWORK value: \"$NETWORK\"" && exit 24
+
+  fi
+
+  showGuestInfo
+
+  if isUserMode && { [ -z "$USER_PORTS" ] || [[ "$APP" == "Virtual DSM" ]]; }; then
+    desc="$APP"
+    [[ "${desc,,}" == "qemu" ]] && desc="the VM"
+    info "Notice: because user-mode networking is active, when you need to forward custom ports to $desc, add them to the \"USER_PORTS\" variable."
+  fi
 
 fi
 
-NET_OPTS+=" -device $ADAPTER,id=net0,netdev=hostnet0,romfile=,mac=$VM_NET_MAC"
-[[ "$MTU" != "0" && "$MTU" != "1500" ]] && NET_OPTS+=",host_mtu=$MTU"
+NET_OPTS+=" -device $ADAPTER,id=net0,netdev=hostnet0,romfile=,mac=$MAC"
 
-html "Initialized network successfully..."
+if [[ "$GUEST_MTU" != "0" && "$GUEST_MTU" != "1500" ]]; then
+  if [[ "${ADAPTER,,}" == "virtio-net-pci" ]]; then
+    NET_OPTS+=",host_mtu=$GUEST_MTU"
+  elif [[ "$GUEST_MTU" -lt "1500" ]]; then
+    warn "MTU size is $GUEST_MTU, but cannot be advertised for $ADAPTER adapters; networking may break on paths below 1500 MTU."
+  fi
+fi
+
+if ! echo "$UPLINK" > "$QEMU_DIR"/qemu.host; then
+  error "Failed to write QEMU host IP file!"
+  exit 24
+fi
+
+if ! echo "$NIC" > "$QEMU_DIR"/qemu.nic; then
+  error "Failed to write QEMU NIC file!"
+  exit 24
+fi
+
+if [ -n "$IP" ]; then
+
+  if ! echo "$IP" > "$QEMU_DIR"/qemu.ip; then
+    error "Failed to write QEMU IP file!"
+    exit 24
+  fi
+
+  if ! echo "http://$IP:$CHECK_PORT" > "$QEMU_DIR"/qemu.url; then
+    error "Failed to write QEMU URL file!"
+    exit 24
+  fi
+
+fi
+
 return 0
