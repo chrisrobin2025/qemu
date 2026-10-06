@@ -3,7 +3,10 @@ services:
     image: qemux/qemu
     container_name: qemu
     environment:
-      BOOT: "mint"
+      BOOT: "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download"
+      RAM_SIZE: "4G"
+      CPU_CORES: "4"
+      DISK_SIZE: "32G"
     devices:
       - /dev/kvm
       - /dev/net/tun
